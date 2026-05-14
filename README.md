@@ -6,6 +6,35 @@ the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
 > **Status:** scaffolding. v0.1 target: SQLite first. Postgres later.
 
+## Foundational principle: kohau builds on ahu
+
+**kohau is built on top of [ahu](https://github.com/kaikailang-org/ahu),
+not on raw kaikai primitives.** Database connections, prepared
+statement caches, and connection pools are long-running stateful
+entities — exactly what ahu cells (Layer 2) and restart helpers
+(Layer 3) exist for. The raw FFI to libsqlite3 (or the wire-protocol
+machinery for Postgres) is the *low-level* surface; the *ergonomic*
+surface that downstream code uses is the cell-wrapped client, which
+gives request/reply query execution, supervised lifecycle, and pipe
+composition.
+
+Concretely: every backend driver exposes two shapes — a low-level
+function form (`open`, `execute`, `prepare`, `close` operating
+directly on the FFI/wire handle) and a cell-based wrapper form
+(`with_client(config, body)`) that runs the client inside an ahu
+cell with proper connection lifecycle, statement caching, and
+restart-on-failure semantics.
+
+This is not optional. Implementations that bypass ahu — connection
+state stored in globals, raw `spawn` for background work, ad-hoc
+reconnect loops — are out of scope for kohau. If a use case can't
+be expressed via ahu primitives, the gap gets filed against ahu,
+not worked around inside kohau.
+
+Implementer agents working on kohau MUST read ahu's `docs/design.md`
+before writing module surfaces, and prefer ahu primitives over raw
+kaikai primitives wherever both are available.
+
 ## Why
 
 kohau is the *inscribed tablet* layer — the substrate on which data
