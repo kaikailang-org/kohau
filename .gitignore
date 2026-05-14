@@ -1,0 +1,9 @@
+kai.lock
+dist/
+target/
+*.tmp
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
