@@ -24,6 +24,7 @@ KAI_BIN     := $(shell command -v kai)
 KAI_PREFIX  := $(shell awk -F'"' '/^exec "/ { print $$2; exit }' "$(KAI_BIN)" | xargs -I{} dirname {} | xargs -I{} dirname {})
 KAIC2       := $(KAI_PREFIX)/libexec/kaikai/kaic2
 RUNTIME_INC := $(KAI_PREFIX)/share/kaikai/include
+STDLIB_ROOT := $(KAI_PREFIX)/share/kaikai/stdlib
 
 # SQLite. Override via `make SQLITE_INC=... SQLITE_LIB=...` if
 # the installation is somewhere non-standard.
@@ -71,7 +72,7 @@ $(SHIM_OBJ): c/sqlite_shim.c c/sqlite_shim.h | $(BUILD)
 # Per-fixture build. Emit C from the kaikai source, then link with
 # the shim and libsqlite3.
 $(BUILD)/%: tests/%.kai $(KOHAU_SRC) $(SHIM_OBJ) kai.toml | $(BUILD)
-	$(KAIC2) --path . $< > $(BUILD)/$*.c
+	KAIKAI_STDLIB_PATH=$(STDLIB_ROOT) $(KAIC2) --path $(STDLIB_ROOT) --path . $< > $(BUILD)/$*.c
 	$(CC) -I$(RUNTIME_INC) -I$(SQLITE_INC) -include c/sqlite_shim.h \
 	  $(BUILD)/$*.c $(SHIM_OBJ) \
 	  -L$(SQLITE_LIB) -lsqlite3 \
