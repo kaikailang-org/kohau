@@ -1,0 +1,195 @@
+# kohau/sqlite.kai — low-level SQLite client for kaikai.
+# Imported by user code as `import kohau.sqlite`; functions are
+# accessed dotted (`sqlite.open(path)`, `sqlite.exec(db, sql)`).
+#
+# This module is the **low-level surface**. It mirrors libsqlite3's
+# native API one-to-one (open, exec, prepare/step/column/finalize),
+# bridged through a C shim that flattens out-parameters and opaque
+# handles into shapes kaikai's FFI v1 can express.
+#
+# A higher-level cell-wrapped client (`with_client(config, body)`)
+# that owns the connection lifecycle, caches prepared statements,
+# and integrates with ahu's restart helpers ships in a sibling
+# module (`kohau.sqlite.client`, post-v1). The low-level surface
+# below is what that wrapper builds on; it is also usable directly
+# for scripts, fixtures, and one-shot tooling that does not need
+# the cell ergonomics.
+#
+# ## Handles flow as `Int`
+#
+# Both the connection (`sqlite3 *` in C) and statement (`sqlite3_stmt *`)
+# handles flow through as `Int`. A handle of `0` means failure
+# (NULL pointer in the shim). Callers check `if h == 0` before
+# proceeding.
+#
+# ```kai
+# let db = sqlite.open(":memory:")
+# if db == 0 { ... handle open failure ... }
+# else { ... use db ... }
+# ```
+#
+# ## Return codes
+#
+# Functions that return `Int` for status codes follow libsqlite3's
+# convention: `0` is `SQLITE_OK`, non-zero is an error code. The
+# two exceptions are `step` (returns `SQLITE_ROW = 100` for "row
+# available", `SQLITE_DONE = 101` for "no more rows", or an error
+# code) and the handle-returning functions (`open`, `prepare`)
+# which return `0` on failure as described above.
+#
+# ## Resource ownership
+#
+# Every `prepare` must be matched by a `finalize`. Every `open`
+# must be matched by a `close`. The low-level surface does NOT
+# enforce this — that's what `kohau.sqlite.client` will do via
+# ahu cell scoping. Direct callers are responsible.
+#
+# ## v1 limitations
+#
+# - No transaction helpers — call `exec(db, "BEGIN")` /
+#   `"COMMIT"` / `"ROLLBACK"` directly.
+# - No bulk binding — bind parameters one at a time via
+#   `bind_text` / `bind_int`.
+# - Only `Int` and `String` column types — `Real`, `Blob`, `NULL`
+#   handling lands when consumers need it.
+# - No connection pool — single connection per `open` call.
+# - Single-statement `exec` only when the statement takes no
+#   parameters; otherwise use the prepare/step flow.
+#
+# ## Stability
+#
+# Every `pub` is `#[unstable]` for the Hanga Roa edition. The
+# v1 surface is brand new; the cell-wrapped client may reshape
+# the low-level signatures as it learns what it actually needs.
+
+# Status code: 0 means SQLITE_OK; other values are SQLite error
+# codes. Re-exported as a named constant so callers don't sprinkle
+# `0` literals.
+pub const SQLITE_OK : Int = 0
+
+# Step result: a row is available, read columns then step again.
+pub const SQLITE_ROW : Int = 100
+
+# Step result: no more rows; finalize the statement.
+pub const SQLITE_DONE : Int = 101
+
+# ---- lifecycle ----
+
+extern "C" fn kai_sqlite_open(path: String) : Int / Ffi
+
+extern "C" fn kai_sqlite_close(h: Int) : Int / Ffi
+
+# Open (or create) the database at `path`. Use `":memory:"` for an
+# in-memory database. Returns the connection handle, or `0` on
+# failure. Callers must check before proceeding.
+#[unstable]
+pub fn open(path: String) : Int / Ffi = kai_sqlite_open(path)
+
+# Close the connection. Returns `SQLITE_OK` on success. Safe to
+# call on a `0` handle (no-op).
+#[unstable]
+pub fn close(h: Int) : Int / Ffi = kai_sqlite_close(h)
+
+# ---- single-shot execution ----
+
+extern "C" fn kai_sqlite_exec(h: Int, sql: String) : Int / Ffi
+
+# Execute one or more parameterless SQL statements. Returns
+# `SQLITE_OK` on success. Use for DDL (CREATE/DROP), bookkeeping
+# (BEGIN/COMMIT), and any non-parameterised write that doesn't
+# need row retrieval.
+#[unstable]
+pub fn exec(h: Int, sql: String) : Int / Ffi = kai_sqlite_exec(h, sql)
+
+# ---- prepared statements ----
+
+extern "C" fn kai_sqlite_prepare(h: Int, sql: String) : Int / Ffi
+
+extern "C" fn kai_sqlite_bind_text(stmt: Int, idx: Int, value: String) : Int / Ffi
+
+extern "C" fn kai_sqlite_bind_int(stmt: Int, idx: Int, value: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_step(stmt: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_column_int(stmt: Int, col: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_column_text(stmt: Int, col: Int) : String / Ffi
+
+extern "C" fn kai_sqlite_reset(stmt: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_finalize(stmt: Int) : Int / Ffi
+
+# Compile `sql` into a statement handle. Returns the statement
+# handle, or `0` on failure.
+#[unstable]
+pub fn prepare(h: Int, sql: String) : Int / Ffi = kai_sqlite_prepare(h, sql)
+
+# Bind a text value to a parameter (1-indexed per SQLite's
+# convention). Returns `SQLITE_OK` on success. The value is
+# copied internally by SQLite, so the caller's string can be
+# dropped after the call.
+#[unstable]
+pub fn bind_text(stmt: Int, idx: Int, value: String) : Int / Ffi =
+  kai_sqlite_bind_text(stmt, idx, value)
+
+# Bind an integer value to a parameter (1-indexed). Returns
+# `SQLITE_OK` on success.
+#[unstable]
+pub fn bind_int(stmt: Int, idx: Int, value: Int) : Int / Ffi =
+  kai_sqlite_bind_int(stmt, idx, value)
+
+# Advance the statement. Returns:
+#   - `SQLITE_ROW` (100): a row is available; read with `column_*`.
+#   - `SQLITE_DONE` (101): no more rows; finalize.
+#   - other codes: error (busy, locked, schema-changed, etc.).
+#[unstable]
+pub fn step(stmt: Int) : Int / Ffi = kai_sqlite_step(stmt)
+
+# Read an integer column from the current row (0-indexed).
+# Returns 0 if the column is NULL or not numeric.
+#[unstable]
+pub fn column_int(stmt: Int, col: Int) : Int / Ffi =
+  kai_sqlite_column_int(stmt, col)
+
+# Read a text column from the current row (0-indexed). The
+# pointer is valid until the next step / finalize on the same
+# statement — the kaikai-side String copies the bytes out
+# automatically as part of the FFI boundary.
+#[unstable]
+pub fn column_text(stmt: Int, col: Int) : String / Ffi =
+  kai_sqlite_column_text(stmt, col)
+
+# Reset a prepared statement so it can be re-stepped or re-bound.
+# Returns the SQLite result code from the prior execution.
+#[unstable]
+pub fn reset(stmt: Int) : Int / Ffi = kai_sqlite_reset(stmt)
+
+# Free the statement. Returns `SQLITE_OK` on success. Safe to call
+# on a `0` handle (no-op). Every `prepare` must be matched by one
+# `finalize`.
+#[unstable]
+pub fn finalize(stmt: Int) : Int / Ffi = kai_sqlite_finalize(stmt)
+
+# ---- diagnostics ----
+
+extern "C" fn kai_sqlite_last_insert_rowid(h: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_changes(h: Int) : Int / Ffi
+
+extern "C" fn kai_sqlite_errmsg(h: Int) : String / Ffi
+
+# rowid of the most recently inserted row on this connection.
+# Returns 0 if no insert has happened.
+#[unstable]
+pub fn last_insert_rowid(h: Int) : Int / Ffi =
+  kai_sqlite_last_insert_rowid(h)
+
+# Number of rows changed by the most recent INSERT / UPDATE /
+# DELETE on this connection.
+#[unstable]
+pub fn changes(h: Int) : Int / Ffi = kai_sqlite_changes(h)
+
+# Human-readable error message from the most recent failed call
+# on this connection. Returns the empty string when no error.
+#[unstable]
+pub fn errmsg(h: Int) : String / Ffi = kai_sqlite_errmsg(h)

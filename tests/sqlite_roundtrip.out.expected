@@ -1,0 +1,14 @@
+open: ok
+create: ok
+insert alpha: ok
+insert bravo: ok
+insert charlie: ok
+last rowid: ok
+changes: ok
+prepare SELECT: ok
+row 1: alpha=10
+row 2: bravo=20
+row 3: charlie=30
+rows read: ok
+count(*): ok
+close: ok

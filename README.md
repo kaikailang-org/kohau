@@ -4,7 +4,58 @@ DB clients for [kaikai](https://github.com/kaikailang-org/kaikai). The
 persistence substrate that sits between the language's effects and
 the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
-> **Status:** scaffolding. v0.1 target: SQLite first. Postgres later.
+> **Status:** v0.1 SQLite low-level surface shipped
+> (`kohau.sqlite`). Cell-wrapped client + connection pool +
+> restart-on-failure (`kohau.sqlite.client` over ahu) is v0.2.
+> Postgres is later.
+
+## What v0.1 ships
+
+**`kohau.sqlite`** — low-level SQLite client. One-to-one mapping
+to libsqlite3's C API, bridged through a thin C shim
+(`c/sqlite_shim.{c,h}`) that flattens shapes kaikai's FFI v1
+cannot express (out-parameters, opaque pointers by value).
+
+Surface (every decl marked `#[unstable]` for the Hanga Roa
+edition):
+
+- **Lifecycle**: `open(path)`, `close(handle)`.
+- **Single-shot**: `exec(handle, sql)` for DDL / BEGIN / COMMIT.
+- **Prepared statements**: `prepare`, `bind_text`, `bind_int`,
+  `step`, `column_int`, `column_text`, `reset`, `finalize`.
+- **Diagnostics**: `last_insert_rowid`, `changes`, `errmsg`.
+
+Handles flow as `Int` (cast from C pointers in the shim). `0`
+means failure for handle-returning functions. Status codes
+follow libsqlite3 convention: `0` is `SQLITE_OK`, `100` is
+`SQLITE_ROW`, `101` is `SQLITE_DONE`.
+
+End-to-end smoke: `tests/sqlite_roundtrip.kai` exercises every
+op against an in-memory database.
+
+## Building
+
+`kai build` does not currently expose link-flag injection, which
+the C shim requires. kohau ships a Makefile that mirrors the
+upstream kaikai stage2 pattern: `kaic2` emits C, then `cc` links
+manually against the shim object and libsqlite3.
+
+Requirements:
+
+- `kai` and `kaic2` on `PATH`. Homebrew installs put `kaic2`
+  under `<prefix>/libexec/libexec/kaikai/kaic2`; the Makefile
+  autodetects via the `kai` wrapper.
+- libsqlite3 headers + library. macOS Homebrew:
+  `/opt/homebrew/opt/sqlite/{include,lib}`. Override via
+  `make SQLITE_INC=... SQLITE_LIB=...` if the install lives
+  elsewhere.
+
+Run the fixtures:
+
+```sh
+make tier0    # compile every fixture
+make tier1    # compile + run + diff against goldens
+```
 
 ## Foundational principle: kohau builds on ahu
 

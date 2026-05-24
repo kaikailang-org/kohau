@@ -7,3 +7,4 @@ target/
 *.sqlite
 *.sqlite3
 .DS_Store
+build/
