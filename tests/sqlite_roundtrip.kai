@@ -1,0 +1,102 @@
+# tests/sqlite_roundtrip.kai — end-to-end smoke for kohau.sqlite.
+#
+# Validates the v1 low-level surface against an in-memory DB:
+#
+#   1. open(":memory:")
+#   2. exec CREATE TABLE
+#   3. prepare + bind_text + bind_int + step + finalize for INSERTs
+#   4. prepare + step loop + column_int + column_text for SELECT
+#   5. last_insert_rowid + changes diagnostics
+#   6. close
+#
+# Trace order is deterministic — the in-memory DB resets per run,
+# rows insert in order, the SELECT iterates them in that same
+# order. No timestamps, no IDs that vary across runs.
+
+import kohau.sqlite
+
+fn check_ok(label: String, ok: Bool) : Unit / Stdout =
+  if ok { Stdout.print(label ++ ": ok") }
+  else  { Stdout.print(label ++ ": FAIL") }
+
+fn check_eq_int(label: String, got: Int, want: Int) : Unit / Stdout =
+  if got == want { Stdout.print(label ++ ": ok") }
+  else { Stdout.print(label ++ ": FAIL got=" ++ int_to_string(got) ++
+                            " want=" ++ int_to_string(want)) }
+
+fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout =
+  if got == want { Stdout.print(label ++ ": ok") }
+  else { Stdout.print(label ++ ": FAIL got='" ++ got ++ "' want='" ++ want ++ "'") }
+
+# Insert a single (name, count) row via prepared statement.
+fn insert_one(db: Int, name: String, count: Int) : Int / Ffi + Stdout = {
+  let stmt = sqlite.prepare(db, "INSERT INTO items (name, count) VALUES (?, ?)")
+  if stmt == 0 {
+    Stdout.print("prepare INSERT: FAIL")
+    0
+  } else {
+    let _ = sqlite.bind_text(stmt, 1, name)
+    let _ = sqlite.bind_int(stmt, 2, count)
+    let rc = sqlite.step(stmt)
+    let _ = sqlite.finalize(stmt)
+    rc
+  }
+}
+
+# Read one row of the SELECT, print "name=N count=K", return 1.
+# Returns 0 on SQLITE_DONE.
+fn read_loop(stmt: Int, n: Int) : Int / Ffi + Stdout = {
+  let rc = sqlite.step(stmt)
+  if rc == 100 {
+    let nm = sqlite.column_text(stmt, 0)
+    let ct = sqlite.column_int(stmt, 1)
+    Stdout.print("row " ++ int_to_string(n) ++ ": " ++ nm ++ "=" ++ int_to_string(ct))
+    read_loop(stmt, n + 1)
+  } else {
+    n
+  }
+}
+
+fn run_with_db(db: Int) : Int / Console + Ffi = {
+  # ---- DDL ----
+  let rc_create = sqlite.exec(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, count INTEGER NOT NULL)")
+  check_eq_int("create", rc_create, 0)
+
+  # ---- INSERTs via prepared statements ----
+  let rc1 = insert_one(db, "alpha", 10)
+  check_eq_int("insert alpha", rc1, 101)
+  let rc2 = insert_one(db, "bravo", 20)
+  check_eq_int("insert bravo", rc2, 101)
+  let rc3 = insert_one(db, "charlie", 30)
+  check_eq_int("insert charlie", rc3, 101)
+
+  # ---- diagnostics ----
+  check_eq_int("last rowid", sqlite.last_insert_rowid(db), 3)
+  check_eq_int("changes", sqlite.changes(db), 1)
+
+  # ---- SELECT ----
+  let sel = sqlite.prepare(db, "SELECT name, count FROM items ORDER BY id")
+  check_ok("prepare SELECT", sel != 0)
+  let read = read_loop(sel, 1)
+  check_eq_int("rows read", read, 4)
+  let _ = sqlite.finalize(sel)
+
+  # ---- single-value SELECT (COUNT) ----
+  let cnt_stmt = sqlite.prepare(db, "SELECT COUNT(*) FROM items")
+  let _ = sqlite.step(cnt_stmt)
+  let total = sqlite.column_int(cnt_stmt, 0)
+  check_eq_int("count(*)", total, 3)
+  let _ = sqlite.finalize(cnt_stmt)
+
+  # ---- close ----
+  let rc_close = sqlite.close(db)
+  check_eq_int("close", rc_close, 0)
+
+  0
+}
+
+fn main() : Int / Console + Ffi = {
+  let db = sqlite.open(":memory:")
+  check_ok("open", db != 0)
+  if db == 0 { 1 } else { run_with_db(db) }
+}
