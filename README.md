@@ -58,6 +58,9 @@ typed helpers:
   `Ok(Some(cols))`, `Ok(None)`, or `Err(msg)`.
 - `query_scalar(c, sql, binds)` — single-Int-column query
   (COUNT, MAX). Returns `Ok(n)` or `Err(msg)`.
+- `with_tx(c, body)` — transaction scope. `BEGIN` on entry,
+  `COMMIT` if `body` returns `Ok`, `ROLLBACK` if it returns `Err`.
+  The body's `Result` is threaded out; atomicity is all-or-nothing.
 - `close(c)` — tell the cell to close the connection and exit.
 
 Values are bound positionally via `[Bind]` (`BindText` / `BindInt`
