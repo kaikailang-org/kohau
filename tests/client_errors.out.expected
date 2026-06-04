@@ -1,0 +1,5 @@
+bad ddl: err
+missing table: err
+bad scalar: err
+recover ddl: ok changes=0
+recover count: 0

@@ -1,0 +1,99 @@
+# tests/client_roundtrip.kai — end-to-end smoke for the
+# cell-wrapped client `kohau.sqlite.client`.
+#
+# Exercises the full request/reply surface against an in-memory
+# DB, all through the cell — the fixture never touches a raw
+# `db: Int` handle:
+#
+#   1. with_client(":memory:", body) opens + spawns the cell
+#   2. exec CREATE TABLE        (no-row, no binds)
+#   3. exec INSERT x3           (no-row, text+int binds)
+#   4. query_scalar COUNT(*)    (scalar Int)
+#   5. query_row by key         (≤1-row, hit)
+#   6. query_row by missing key (≤1-row, miss → Ok(None))
+#   7. exec DELETE              (no-row, changes count)
+#   8. query_scalar COUNT(*)    (scalar Int, post-delete)
+#   9. close                    (cell closes the connection, exits)
+#
+# Crucially, `body`'s row is `Actor[SqlMsg] + Console` — there is
+# NO `Ffi` at the call site. The cell is the sole FFI owner. This
+# fixture is the proof that the seal holds end to end.
+#
+# Trace order is deterministic: the in-memory DB resets per run,
+# rows insert in order, COUNT is stable.
+
+import actor
+import kohau.sqlite.client
+
+fn show_exec(label: String, r: Result[String, Int]) : Unit / Console =
+  match r {
+    Ok(changed) -> Stdout.print(label ++ ": ok changes=" ++ int_to_string(changed))
+    Err(msg)    -> Stdout.print(label ++ ": ERR " ++ msg)
+  }
+
+fn show_scalar(label: String, r: Result[String, Int]) : Unit / Console =
+  match r {
+    Ok(n)    -> Stdout.print(label ++ ": " ++ int_to_string(n))
+    Err(msg) -> Stdout.print(label ++ ": ERR " ++ msg)
+  }
+
+fn show_row(label: String, r: Result[String, Option[[String]]]) : Unit / Console =
+  match r {
+    Ok(opt) -> match opt {
+      Some(cols) -> Stdout.print(label ++ ": found data=" ++ first_col(cols))
+      None       -> Stdout.print(label ++ ": absent")
+    }
+    Err(msg) -> Stdout.print(label ++ ": ERR " ++ msg)
+  }
+
+fn first_col(cols: [String]) : String =
+  match cols {
+    []        -> "<empty>"
+    [x, ..._] -> x
+  }
+
+# The body runs entirely in Actor[SqlMsg] + Console — no Ffi.
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
+  # ---- DDL ----
+  show_exec("create",
+    client.exec(c, "CREATE TABLE todos (id TEXT PRIMARY KEY, data TEXT NOT NULL)", []))
+
+  # ---- INSERTs (text + text binds) ----
+  show_exec("insert t1",
+    client.exec(c, "INSERT INTO todos (id, data) VALUES (?, ?)",
+      [BindText("t1"), BindText("buy milk")]))
+  show_exec("insert t2",
+    client.exec(c, "INSERT INTO todos (id, data) VALUES (?, ?)",
+      [BindText("t2"), BindText("walk dog")]))
+  show_exec("insert t3",
+    client.exec(c, "INSERT INTO todos (id, data) VALUES (?, ?)",
+      [BindText("t3"), BindText("write code")]))
+
+  # ---- scalar COUNT ----
+  show_scalar("count after insert",
+    client.query_scalar(c, "SELECT COUNT(*) FROM todos", []))
+
+  # ---- query_row: hit ----
+  show_row("find t2",
+    client.query_row(c, "SELECT data FROM todos WHERE id = ?", [BindText("t2")]))
+
+  # ---- query_row: miss ----
+  show_row("find t9",
+    client.query_row(c, "SELECT data FROM todos WHERE id = ?", [BindText("t9")]))
+
+  # ---- DELETE ----
+  show_exec("delete t1",
+    client.exec(c, "DELETE FROM todos WHERE id = ?", [BindText("t1")]))
+
+  # ---- scalar COUNT post-delete ----
+  show_scalar("count after delete",
+    client.query_scalar(c, "SELECT COUNT(*) FROM todos", []))
+
+  # ---- shutdown: cell closes the connection ----
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console = {
+  with_mailbox { client.with_client(":memory:", body) }
+  0
+}

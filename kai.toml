@@ -4,10 +4,22 @@ edition = "hanga-roa"
 
 [dependencies]
 
+# ahu (concurrency / fault-tolerance, layer 2). kohau's
+# cell-wrapped client (`kohau.sqlite.client`) is built on ahu
+# cells: the connection is owned by an `ahu.cell` step function.
+# Resolved as a git dependency; `kai install` fetches the tagged
+# release into the user-level cache. This is the foundational
+# principle documented in README §*kohau builds on ahu* — the
+# ergonomic surface is a cell, not raw kaikai primitives.
+ahu = { source = "github.com/kaikailang-org/ahu", ref = "v0.1.0" }
+
 # kohau's own tier1 fixtures import kohau's #[unstable] decls
-# (sqlite.* in v1). Opting in here acknowledges the disclosure
-# for the in-tree fixtures so the build is warning-free.
+# (sqlite.* low-level, client.* cell-wrapped) plus ahu's cell.*
+# (cell.ask is #[unstable]). Opting in here acknowledges the
+# disclosure for the in-tree fixtures so the build is warning-free.
 # Downstream consumers do the same in their own kai.toml.
 [unstable]
 kohau = true
 sqlite = true
+client = true
+cell = true

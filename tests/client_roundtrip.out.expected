@@ -1,0 +1,9 @@
+create: ok changes=0
+insert t1: ok changes=1
+insert t2: ok changes=1
+insert t3: ok changes=1
+count after insert: 3
+find t2: found data=walk dog
+find t9: absent
+delete t1: ok changes=1
+count after delete: 2
