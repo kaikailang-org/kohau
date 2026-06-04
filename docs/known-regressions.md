@@ -57,3 +57,45 @@ fixtures opt in (`sqlite`, `client`, `cell` under `[unstable]`), so
 direct uses are warning-free.
 
 **Status.** Also observed and documented by henua. Open upstream.
+
+## ahu
+
+### `restartable_cell` forces the driver to carry the step's effects
+
+**Symptom.** `ahu.restart.restartable_cell` is built on
+`ahu.cell.with_cell`, which shares a single open row variable
+between the cell's `step` and its `driver`. A step that carries an
+effect (e.g. `Ffi`) therefore forces the driver to carry the *same*
+effect. Verified against kaikai 0.86.1 with a fixture (step `/ Ffi`,
+driver pure):
+
+```
+error: type mismatch in function call
+  = note: `restart.restartable_cell` expects:
+      (..., (Int, M) -> StepResult[Int] / Actor[M] + Ffi,
+            (Pid[M]) -> Unit / Actor[M] + Ffi) -> ...
+  = note: found:
+      (..., (Int, M) -> ... / Actor[M] + Ffi,
+            (Pid[M]) -> Unit / Actor[M]) -> ?t   # driver without Ffi rejected
+```
+
+**Impact on kohau.** Blocks supervising `kohau.sqlite.client` with
+`restartable_cell`: the client's step carries `Ffi`, so routing it
+through `restartable_cell` would re-introduce `Ffi` into the driver
+and — transitively — into henua's body above it, breaking the FFI
+seal that is the entire point of the cell-wrapped client. This is
+*one* of the reasons restart-on-failure is a not-goal for SQLite
+(the others are intrinsic to SQLite being embedded — see
+`docs/design.md` §*Why restart-on-failure is a not-goal for
+SQLite*); it would be the binding blocker for the Postgres driver,
+where restart genuinely pays off.
+
+**Workaround.** None in kohau. The fix belongs in ahu: a restart
+helper that hand-spawns the cell with `spawn_actor` (the way
+kohau's `with_client` already does to seal `Ffi`) rather than
+`with_cell`. Until ahu ships that variant, a supervised
+FFI-carrying cell cannot keep its effect sealed from the supervised
+body.
+
+**Status.** Open against ahu. Not blocking any kohau tier1 fixture
+(kohau does not attempt restart in v1).
