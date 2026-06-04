@@ -122,12 +122,20 @@ cell executes **complete, atomic operations** and returns
   BEGIN/COMMIT). Reply carries `sqlite.changes()`.
 - `QueryRow` — a ≤1-row statement. Reply is the row's TEXT columns
   or "absent". This is the `find`-by-primary-key shape.
+- `QueryRows` — a multi-row statement. Reply is every row's TEXT
+  columns as `[[String]]` (empty list for no rows).
 - `QueryScalar` — a single-Int-column statement (COUNT, MAX).
 
-Multi-row result sets are out of scope for v1: the consumer above
-kohau (henua's `SqliteRepository`) operates on a single row keyed by
-id, and a streaming multi-row protocol over the mailbox needs a
-back-pressure design no fixture motivates yet.
+`QueryRows` discovers its column count at runtime via
+`sqlite.column_count` (a primitive added to the low-level surface
+for exactly this), so it handles `SELECT *` and explicit column
+lists without the caller declaring a width. It **materialises** the
+full result set before replying: the reply is one `[[String]]`, not
+a stream. This is right for the bounded result sets the consumer
+above kohau needs (henua's `repository.all` over a per-aggregate
+table). A streaming / chunked reply over the mailbox — with the
+back-pressure design that entails — is a follow-up for unbounded
+scans; no fixture motivates it yet.
 
 ### Liveness under failure
 

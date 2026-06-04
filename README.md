@@ -26,7 +26,8 @@ edition):
 - **Lifecycle**: `open(path)`, `close(handle)`.
 - **Single-shot**: `exec(handle, sql)` for DDL / BEGIN / COMMIT.
 - **Prepared statements**: `prepare`, `bind_text`, `bind_int`,
-  `step`, `column_int`, `column_text`, `reset`, `finalize`.
+  `step`, `column_int`, `column_text`, `column_count`, `reset`,
+  `finalize`.
 - **Diagnostics**: `last_insert_rowid`, `changes`, `errmsg`.
 
 Handles flow as `Int` (cast from C pointers in the shim). `0`
@@ -56,6 +57,10 @@ typed helpers:
   UPDATE). Returns `Ok(changes)` or `Err(msg)`.
 - `query_row(c, sql, binds)` — ≤1-row query. Returns
   `Ok(Some(cols))`, `Ok(None)`, or `Err(msg)`.
+- `query_rows(c, sql, binds)` — multi-row query. Returns
+  `Ok([[String]])` (every row's columns, possibly empty) or
+  `Err(msg)`. Column count is discovered from the statement, so
+  `SELECT *` works without declaring a width.
 - `query_scalar(c, sql, binds)` — single-Int-column query
   (COUNT, MAX). Returns `Ok(n)` or `Err(msg)`.
 - `with_tx(c, body)` — transaction scope. `BEGIN` on entry,

@@ -115,6 +115,8 @@ extern "C" fn kai_sqlite_column_int(stmt: Int, col: Int) : Int / Ffi
 
 extern "C" fn kai_sqlite_column_text(stmt: Int, col: Int) : String / Ffi
 
+extern "C" fn kai_sqlite_column_count(stmt: Int) : Int / Ffi
+
 extern "C" fn kai_sqlite_reset(stmt: Int) : Int / Ffi
 
 extern "C" fn kai_sqlite_finalize(stmt: Int) : Int / Ffi
@@ -158,6 +160,15 @@ pub fn column_int(stmt: Int, col: Int) : Int / Ffi =
 #[unstable]
 pub fn column_text(stmt: Int, col: Int) : String / Ffi =
   kai_sqlite_column_text(stmt, col)
+
+# Number of columns in the statement's result set. Valid after
+# `prepare` (before the first `step`), so callers can discover how
+# many columns a SELECT returns without hardcoding the count — both
+# `SELECT *` and explicit column lists work. Returns `0` for
+# statements with no result set (DDL, INSERT/UPDATE/DELETE).
+#[unstable]
+pub fn column_count(stmt: Int) : Int / Ffi =
+  kai_sqlite_column_count(stmt)
 
 # Reset a prepared statement so it can be re-stepped or re-bound.
 # Returns the SQLite result code from the prior execution.
