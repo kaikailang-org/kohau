@@ -1,49 +1,59 @@
 # kohau Makefile.
 #
-# kohau's `sqlite` module binds libsqlite3 through a C shim (see
-# c/sqlite_shim.{c,h}). `kai build` does not currently expose
-# link-flag injection, so we replicate the upstream flow that the
-# kaikai stage2 Makefile uses for FFI fixtures:
+# kohau binds libsqlite3 through a C shim (see c/sqlite_shim.{c,h}),
+# and — since v0.2 — its cell-wrapped client (`kohau.sqlite.client`)
+# depends on the `ahu` package (resolved as a git-dep in kai.toml).
 #
-#   1. `kaic2 <fixture>.kai > <fixture>.c`   — emit C
-#   2. `cc -include shim.h ... -lsqlite3`    — link manually
+# Two consequences for the build:
+#
+#   1. Dependency resolution. The `ahu` dep must be fetched into the
+#      user-level cache and pinned in kai.lock before fixtures that
+#      import `kohau.sqlite.client` can compile. `make` runs
+#      `kai install` automatically when kai.lock is absent or older
+#      than kai.toml.
+#   2. Link flags. The shim sources and `-lsqlite3` are passed to the
+#      `kai build` driver through `CFLAGS`, which the `kai` wrapper
+#      forwards to its underlying `cc`. We use `kai build` as the
+#      driver (not raw `kaic2`) because it owns stdlib prelude
+#      assembly, package-path resolution (so the `ahu` dep resolves),
+#      and edition gates. This mirrors henua's Makefile and the
+#      idiomatic `lnds/uira` raylib pattern.
 #
 # Requirements on the host:
 #
-#   - `kai` and `kaic2` on PATH (Homebrew install lands kaic2 in
-#     `<prefix>/libexec/libexec/kaikai/kaic2`; this Makefile asks
-#     the user-facing `kai` wrapper for its install root).
-#   - libsqlite3 development headers + library. macOS Homebrew
-#     ships them under `/opt/homebrew/opt/sqlite/`; Linux distros
-#     ship them under `/usr/include` and `/usr/lib` typically.
+#   - `kai` on PATH (`brew install kaikailang-org/kaikai/kaikai`),
+#     version 0.83.0+ for git-dep resolution.
+#   - libsqlite3 development headers + library. macOS Homebrew ships
+#     them under `/opt/homebrew/opt/sqlite/`; Linux distros ship them
+#     under `/usr/include` and `/usr/lib` typically.
 
-# Locate kaic2 and the kaikai runtime headers via the `kai` wrapper.
-# The wrapper is a thin shell script; we extract its exec path and
-# derive the include + libexec roots from it.
-KAI_BIN     := $(shell command -v kai)
-KAI_PREFIX  := $(shell awk -F'"' '/^exec "/ { print $$2; exit }' "$(KAI_BIN)" | xargs -I{} dirname {} | xargs -I{} dirname {})
-KAIC2       := $(KAI_PREFIX)/libexec/kaikai/kaic2
-RUNTIME_INC := $(KAI_PREFIX)/share/kaikai/include
-STDLIB_ROOT := $(KAI_PREFIX)/share/kaikai/stdlib
+KAI_BIN ?= kai
 
-# SQLite. Override via `make SQLITE_INC=... SQLITE_LIB=...` if
-# the installation is somewhere non-standard.
+# SQLite. Override via `make SQLITE_INC=... SQLITE_LIB=...` if the
+# installation is somewhere non-standard.
 SQLITE_INC := /opt/homebrew/opt/sqlite/include
 SQLITE_LIB := /opt/homebrew/opt/sqlite/lib
 
-CC ?= cc
+# The shim ships inside this repo (unlike henua, which fetches it
+# from the kohau cache). `-include` brings the shim declarations
+# into the generated C; the shim source is appended so `cc` compiles
+# + links it in one step; `-lsqlite3` resolves the symbols it calls.
+SHIM_C := c/sqlite_shim.c
+SHIM_H := c/sqlite_shim.h
+
+KAI_CFLAGS := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
+              -I$(SQLITE_INC) -include $(SHIM_H) $(SHIM_C) \
+              -L$(SQLITE_LIB) -lsqlite3
 
 BUILD = build
 
-# Fixture discovery.
+# Fixture discovery. Every tests/*.kai is an FFI fixture (they all
+# reach libsqlite3, directly via kohau.sqlite or through the cell).
 TEST_KAI   = $(wildcard tests/*.kai)
 TEST_NAMES = $(patsubst tests/%.kai,%,$(TEST_KAI))
 TEST_BINS  = $(addprefix $(BUILD)/,$(TEST_NAMES))
 
-# The shim object — every fixture links against it.
-SHIM_OBJ = $(BUILD)/sqlite_shim.o
-
-KOHAU_SRC = $(wildcard kohau/*.kai)
+KOHAU_SRC = $(wildcard kohau/*.kai) $(wildcard kohau/sqlite/*.kai)
 
 .PHONY: tier0 tier1 tier1-fixtures clean
 
@@ -65,18 +75,17 @@ tier1-fixtures: $(TEST_BINS)
 	  echo "tier1: $$n OK"; \
 	done
 
-# Shim object — compiled once, linked into every fixture.
-$(SHIM_OBJ): c/sqlite_shim.c c/sqlite_shim.h | $(BUILD)
-	$(CC) -c c/sqlite_shim.c -I$(SQLITE_INC) -o $@
+# Per-fixture build. `kai build` is the driver; the shim sources and
+# `-lsqlite3` go through CFLAGS. Depends on kai.lock so a missing or
+# stale lockfile triggers an install first.
+$(BUILD)/%: tests/%.kai $(KOHAU_SRC) $(SHIM_C) $(SHIM_H) kai.toml kai.lock | $(BUILD)
+	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build $< -o $@
 
-# Per-fixture build. Emit C from the kaikai source, then link with
-# the shim and libsqlite3.
-$(BUILD)/%: tests/%.kai $(KOHAU_SRC) $(SHIM_OBJ) kai.toml | $(BUILD)
-	KAIKAI_STDLIB_PATH=$(STDLIB_ROOT) $(KAIC2) --path $(STDLIB_ROOT) --path . $< > $(BUILD)/$*.c
-	$(CC) -I$(RUNTIME_INC) -I$(SQLITE_INC) -include c/sqlite_shim.h \
-	  $(BUILD)/$*.c $(SHIM_OBJ) \
-	  -L$(SQLITE_LIB) -lsqlite3 \
-	  -o $@
+# kai.lock — produced by `kai install`. Treat it as a build input so
+# fixtures rebuild after a dependency change and an install runs when
+# the lockfile is absent or older than kai.toml.
+kai.lock: kai.toml
+	$(KAI_BIN) install
 
 $(BUILD):
 	mkdir -p $(BUILD)

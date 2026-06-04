@@ -1,0 +1,436 @@
+# kohau/sqlite/client.kai — cell-wrapped SQLite client.
+#
+# Imported by user code as `import kohau.sqlite.client`; types
+# stay bare (`SqlMsg`, `Bind`, `SqlReply` is folded into `SqlMsg`),
+# functions are accessed dotted (`client.with_client(path, body)`,
+# `client.exec(c, sql)`, `client.query_row(c, sql, binds)`).
+#
+# This is the **ergonomic surface** of kohau. The low-level
+# `kohau.sqlite` module mirrors libsqlite3 one-to-one with raw
+# `Int` handles the caller must open, prepare, step, finalize, and
+# close by hand. This module wraps a single connection inside an
+# ahu cell (a fiber + typed mailbox + recursive step function),
+# which buys three things the low-level surface cannot give:
+#
+#   1. **Ownership of the connection lifecycle.** The cell opens
+#      the connection on spawn and closes it when it receives
+#      `Shutdown` (or when `with_client`'s scope ends). Callers
+#      never hold a raw `db: Int`, never forget to `close`.
+#   2. **Request/reply over a typed mailbox.** Callers send a
+#      high-level operation (`exec` / `query_row` / `query_scalar`)
+#      and receive a structured result. They never touch
+#      prepare/step/finalize.
+#   3. **Ffi confinement.** The cell-fiber is the only code that
+#      touches `Ffi`. Callers run in `Actor[SqlMsg]`, not `Ffi`.
+#      This is the load-bearing property for the layers above
+#      kohau: henua's `SqliteRepository` drops `/ Ffi` from its
+#      operations and carries only `/ Actor[SqlMsg]`.
+#
+# ## Why `with_client(path, body)` and not `connect(path) : Pid`
+#
+# kaikai's region-brand walker forbids a `Pid[Msg]` from escaping
+# the scope that created it (the same constraint that gives ahu's
+# `with_cell` its `with_X(initial, step, body)` shape). A
+# `connect(path) : Pid[SqlMsg]` form is rejected by the compiler:
+# `Pid[Msg] cannot escape connect's structured-concurrency scope`.
+# So the connection's lifetime is a lexical scope — `body` receives
+# the client pid and may use it freely; when `body` returns, the
+# scope ends. This is not a stylistic choice; it is the only shape
+# the type system permits.
+#
+# ## Why the protocol is high-level, not a transliteration of FFI
+#
+# The mailbox is a process boundary. Exposing `prepare` / `step` /
+# `finalize` *across* it would mean a statement handle (a raw FFI
+# pointer that lives in the cell's address space) crossing the
+# boundary in a reply — meaningless to the caller and a lifetime
+# foot-gun. Instead the cell executes *complete, atomic operations*
+# and returns *values*:
+#
+#   - `Exec`        — run a parameterless or value-bound statement
+#                     that returns no rows (DDL, INSERT, DELETE,
+#                     UPDATE, BEGIN/COMMIT). Reply carries the
+#                     SQLite rc and the `changes()` count.
+#   - `QueryRow`    — run a statement that returns at most one row.
+#                     Reply is the row's columns as `[String]`, or
+#                     "absent". This is exactly what a primary-key
+#                     `find` needs.
+#   - `QueryScalar` — run a statement that returns a single Int
+#                     column (COUNT, MAX, a scalar SELECT). Reply
+#                     is the Int.
+#
+# Multi-row result sets are intentionally out of scope for v1: the
+# adapters above kohau (henua's `SqliteRepository`) operate on a
+# single row keyed by id, and a streaming multi-row protocol over
+# the mailbox needs a back-pressure design that no fixture motivates
+# yet. When `henua.repository.all` grows a persistent backend, a
+# `QueryRows` variant with a chunked reply (or an ahu `Stream`
+# source) lands then. See §*v1 limitations*.
+#
+# ## Binds
+#
+# Values are bound positionally (1-indexed, SQLite convention) via
+# a `[Bind]` list. v1 binds `Text` and `Int` — the two column
+# affinities the low-level surface supports. Adding `Real` / `Blob`
+# / `Null` is a matter of one variant each plus the matching
+# `kohau.sqlite` bind op; deferred until a consumer needs them.
+# Binds protect every *value*: the adapter never concatenates a
+# value into SQL. (Identifiers — table/column names — cannot be
+# bound in SQLite and remain the caller's validation responsibility;
+# see henua's `sqlite_repository.kai` §*Security*.)
+#
+# ## v1 limitations
+#
+#   - **No statement cache.** Each operation prepares and finalizes
+#     its own statement. A prepared-statement cache (an LRU
+#     `Map[String, Int]` in the cell's state) is an obvious
+#     optimisation, but it adds invalidation complexity over raw FFI
+#     pointers with no fixture demonstrating the cost matters. v2.
+#   - **No transactions surface.** Wrap with
+#     `client.exec(c, "BEGIN")` / `"COMMIT"` / `"ROLLBACK"`. A typed
+#     transaction scope (`with_tx(c, body)`) lands when a fixture
+#     needs multi-statement atomicity.
+#   - **No multi-row queries.** See above.
+#   - **No restart-on-failure yet.** `with_client` spawns a bare
+#     cell. Wrapping it in ahu's `restartable_cell` so a crashed
+#     connection respawns is the next lane (it needs a reconnection
+#     story: re-`open` resets the handle, but in-flight prepared
+#     statements and any open transaction are lost — a real design
+#     question, not a wrapper). Tracked as a follow-up.
+#
+# ## Stability
+#
+# Every `pub` is `#[unstable]` for the Hanga Roa edition. The
+# protocol shape (`SqlMsg`, `Bind`) and the helper surface
+# (`with_client`, `exec`, `query_row`, `query_scalar`) may reshape
+# as the restart story and the multi-row protocol land.
+
+import spawn
+import actor
+import ahu.cell
+import kohau.sqlite
+
+# ---- protocol ----
+
+# Positional bind value. 1-indexed per SQLite convention. v1 binds
+# the two affinities the low-level surface supports.
+#[unstable]
+pub type Bind
+  = BindText(String)
+  | BindInt(Int)
+
+# The reply payload. **Carries no `Pid`** — this is load-bearing.
+# kaikai's region-brand walker forbids a value containing a
+# `Pid[Msg]` from being *returned* out of a function (it could
+# outlive the actor scope that minted the pid). The cell's
+# per-operation helpers (`run_exec` etc.) produce a reply value and
+# return it to the step function; if that value's type could embed a
+# pid, the walker rejects the return even when the actual variant
+# never holds one. Splitting the reply into its own pid-free type
+# sidesteps that entirely and is also cleaner: a request needs a
+# reply target, a reply never does.
+#
+#   ExecOk(changes)  — no-row statement succeeded; `changes` is
+#                      `sqlite.changes()` after the step
+#   RowFound(cols)   — ≤1-row query hit; the row's TEXT columns
+#   RowAbsent        — ≤1-row query returned no rows
+#   ScalarInt(n)     — scalar query returned the Int `n`
+#   SqlErr(msg)      — any SQLite-side failure, message from errmsg
+#[unstable]
+pub type SqlReply
+  = ExecOk(Int)
+  | RowFound([String])
+  | RowAbsent
+  | ScalarInt(Int)
+  | SqlErr(String)
+
+# The cell's mailbox message type. Mono-mailbox: kaikai's
+# `Actor.send : Pid[T] -> T` ties the reply target's type to the
+# active handler's Msg, so the reply travels back on the same
+# mailbox as the request — wrapped in the `Reply` variant. The
+# request variants carry the reply pid; `Reply` carries the pid-free
+# `SqlReply`. Callers never construct or match these directly — the
+# typed helpers below do that.
+#
+#   Exec(sql, binds, reply)        — no-row statement
+#   QueryRow(sql, binds, reply)    — ≤1-row statement
+#   QueryScalar(sql, binds, reply) — single-Int-column statement
+#   Shutdown                       — close the connection, exit
+#   Reply(payload)                 — a reply sent back to a caller
+#[unstable]
+pub type SqlMsg
+  = Exec(String, [Bind], Pid[SqlMsg])
+  | QueryRow(String, [Bind], Pid[SqlMsg])
+  | QueryScalar(String, [Bind], Pid[SqlMsg])
+  | Shutdown
+  | Reply(SqlReply)
+
+# ---- cell internals ----
+
+# Bind one positional value onto a prepared statement. Returns the
+# SQLite rc (0 == SQLITE_OK).
+fn apply_bind(stmt: Int, idx: Int, b: Bind) : Int / Ffi =
+  match b {
+    BindText(s) -> sqlite.bind_text(stmt, idx, s)
+    BindInt(n)  -> sqlite.bind_int(stmt, idx, n)
+  }
+
+# Bind a whole list of positional values, starting at index `idx`.
+# Stops and returns the first non-OK rc; returns 0 if all bind
+# clean. Recursion (no loop) keeps it tail-shaped.
+fn apply_binds(stmt: Int, idx: Int, binds: [Bind]) : Int / Ffi =
+  match binds {
+    []         -> 0
+    [b, ...bs] -> {
+      let rc = apply_bind(stmt, idx, b)
+      if rc != 0 { rc } else { apply_binds(stmt, idx + 1, bs) }
+    }
+  }
+
+# Read the first `n` TEXT columns of the current row into a list.
+# Builds the list head-first via recursion.
+fn read_text_cols(stmt: Int, col: Int, n: Int) : [String] / Ffi =
+  if col >= n { [] }
+  else {
+    let v = sqlite.column_text(stmt, col)
+    [v, ...read_text_cols(stmt, col + 1, n)]
+  }
+
+# Execute a no-row statement: prepare, bind, step once, finalize.
+# Returns the pid-free reply payload to send back. Atomic — the
+# statement is fully consumed before this returns.
+fn run_exec(db: Int, sql: String, binds: [Bind]) : SqlReply / Ffi = {
+  let stmt = sqlite.prepare(db, sql)
+  if stmt == 0 {
+    SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  } else {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      let changed = sqlite.changes(db)
+      let _ = sqlite.finalize(stmt)
+      # SQLITE_DONE (101) is success for a no-row statement.
+      if rc_step == 101 {
+        ExecOk(changed)
+      } else {
+        SqlErr("step failed: " ++ sqlite.errmsg(db))
+      }
+    }
+  }
+}
+
+# Execute a ≤1-row statement. The `ncols` argument tells the cell
+# how many columns to read off the row. Returns RowFound(cols),
+# RowAbsent, or SqlErr.
+fn run_query_row(db: Int, sql: String, binds: [Bind], ncols: Int) : SqlReply / Ffi = {
+  let stmt = sqlite.prepare(db, sql)
+  if stmt == 0 {
+    SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  } else {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      # SQLITE_ROW (100): a row is available.
+      if rc_step == 100 {
+        let cols = read_text_cols(stmt, 0, ncols)
+        let _ = sqlite.finalize(stmt)
+        RowFound(cols)
+      } else {
+        let _ = sqlite.finalize(stmt)
+        # SQLITE_DONE (101): no rows; anything else is an error.
+        if rc_step == 101 { RowAbsent }
+        else { SqlErr("step failed: " ++ sqlite.errmsg(db)) }
+      }
+    }
+  }
+}
+
+# Execute a single-Int-column statement (COUNT, MAX, scalar SELECT).
+fn run_query_scalar(db: Int, sql: String, binds: [Bind]) : SqlReply / Ffi = {
+  let stmt = sqlite.prepare(db, sql)
+  if stmt == 0 {
+    SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  } else {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      if rc_step == 100 {
+        let n = sqlite.column_int(stmt, 0)
+        let _ = sqlite.finalize(stmt)
+        ScalarInt(n)
+      } else {
+        let _ = sqlite.finalize(stmt)
+        SqlErr("step failed: " ++ sqlite.errmsg(db))
+      }
+    }
+  }
+}
+
+# The cell's step function. State is the connection handle `db`.
+# Each request runs to completion, replies, and keeps the same db.
+# `QueryRow` carries no column count in the message — the protocol
+# fixes single-column TEXT rows for the `find`-by-key shape henua
+# uses (the `data` column). A richer column-count negotiation lands
+# with the multi-row protocol.
+#
+# Why `ncols = 1` baked in: henua's schema is `(id TEXT PRIMARY
+# KEY, data TEXT NOT NULL)` and `find` selects only `data`. The one
+# place a wider row is read (a future `all`) belongs to the
+# multi-row protocol, not here.
+fn sql_step(db: Int, msg: SqlMsg) : StepResult[Int] / Actor[SqlMsg] + Ffi =
+  match msg {
+    Exec(sql, binds, reply_to) -> {
+      Actor.send(reply_to, Reply(run_exec(db, sql, binds)))
+      cell.keep(db)
+    }
+    QueryRow(sql, binds, reply_to) -> {
+      Actor.send(reply_to, Reply(run_query_row(db, sql, binds, 1)))
+      cell.keep(db)
+    }
+    QueryScalar(sql, binds, reply_to) -> {
+      Actor.send(reply_to, Reply(run_query_scalar(db, sql, binds)))
+      cell.keep(db)
+    }
+    Shutdown -> {
+      let _ = sqlite.close(db)
+      cell.cell_done()
+    }
+    # A `Reply` never arrives at the cell's own mailbox; if one does
+    # (a misrouted message), ignore it and keep running.
+    Reply(_) -> cell.keep(db)
+  }
+
+# The cell dispatch loop, spawned as its own fiber by `with_client`.
+# Mirrors ahu's internal `cell_loop` but lives here so `with_client`
+# can hand-spawn it (see the module header on why `with_cell` is not
+# used: it shares one row variable between step and body, which would
+# leak this loop's `Ffi` into `with_client`'s body).
+fn sql_loop(db: Int) : Unit / Actor[SqlMsg] + Ffi = {
+  let msg = Actor.receive()
+  match sql_step(db, msg) {
+    Continue(d) -> sql_loop(d)
+    Done        -> ()
+  }
+}
+
+# ---- public surface ----
+
+# Open a SQLite connection, run it inside a cell, and call `body`
+# with the client pid. The connection is opened on entry and the
+# cell-fiber drives it; `body` talks to the cell via the typed
+# helpers below. When `body` finishes, it is responsible for sending
+# `Shutdown` (the helpers expose `close`); the cell then closes the
+# connection and exits.
+#
+# The effect rows are the load-bearing part of this signature:
+#
+#   - `with_client`'s row carries `Ffi` (it opens the connection and
+#     spawns the FFI-touching loop) and `Spawn` (it spawns the cell)
+#     and `Actor[SqlMsg]` (the caller's mailbox the helpers use).
+#   - `body`'s row is `Actor[SqlMsg] + e` — **no `Ffi`**. The cell
+#     is the sole owner of the FFI boundary. This is what lets henua
+#     run its repository operations in `Actor[SqlMsg]` instead of
+#     `Ffi`.
+#
+# The `+ e` on body lets callers thread their own effects (Console
+# for tracing, etc.) without `with_client` having to know about them.
+#
+# Returns `0` from `open` on failure: the caller's first helper call
+# will then get `SqlErr` from the cell (the cell runs against a `0`
+# handle, every op fails fast with the SQLite errmsg). A caller that
+# wants to fail before entering `body` can check by issuing a trivial
+# `exec(c, "SELECT 1")` first; a typed open-failure path is a
+# follow-up once a fixture needs to distinguish "bad path" from
+# "bad SQL".
+#[unstable]
+pub fn with_client[R, e](
+  path: String,
+  body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e
+) : R / Spawn + Ffi + Actor[SqlMsg] + e = {
+  let db  = sqlite.open(path)
+  let pid = spawn_actor(() => sql_loop(db))
+  body(pid)
+}
+
+# Unwrap a mailbox message into its reply payload. `cell.ask`
+# returns *any* `SqlMsg` (the mailbox can in principle hold a stray
+# request), so the helpers first peel the `Reply` wrapper. A
+# non-`Reply` message is a protocol violation — it means something
+# other than this cell sent to the caller's mailbox between the ask
+# and the receive. We surface it as `SqlErr` rather than guess.
+fn expect_reply(msg: SqlMsg) : SqlReply =
+  match msg {
+    Reply(payload)        -> payload
+    Exec(_, _, _)         -> SqlErr("protocol: stray Exec on reply mailbox")
+    QueryRow(_, _, _)     -> SqlErr("protocol: stray QueryRow on reply mailbox")
+    QueryScalar(_, _, _)  -> SqlErr("protocol: stray QueryScalar on reply mailbox")
+    Shutdown              -> SqlErr("protocol: stray Shutdown on reply mailbox")
+  }
+
+# Run a no-row statement (DDL, INSERT, DELETE, UPDATE, BEGIN/COMMIT).
+# Returns `Ok(changes)` — the row count affected — on success, or
+# `Err(msg)` on a SQLite failure. Lives in `Actor[SqlMsg]` — no
+# `Ffi` at the call site.
+#[unstable]
+pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind])
+  : Result[String, Int] / Actor[SqlMsg] = {
+  let reply = cell.ask(c, (me) => Exec(sql, binds, me))
+  match expect_reply(reply) {
+    ExecOk(changed) -> Ok(changed)
+    SqlErr(msg)     -> Err(msg)
+    # These payloads cannot answer an `Exec`; treat as a violation.
+    RowFound(_)     -> Err("protocol: RowFound reply to Exec")
+    RowAbsent       -> Err("protocol: RowAbsent reply to Exec")
+    ScalarInt(_)    -> Err("protocol: ScalarInt reply to Exec")
+  }
+}
+
+# Run a ≤1-row query. Returns `Ok(Some(cols))` if a row was found
+# (cols are the row's TEXT columns), `Ok(None)` if no row matched,
+# or `Err(msg)` on a SQLite failure. v1 reads a single TEXT column
+# (the `find`-by-key shape); the returned list has length 1 on a hit.
+#[unstable]
+pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind])
+  : Result[String, Option[[String]]] / Actor[SqlMsg] = {
+  let reply = cell.ask(c, (me) => QueryRow(sql, binds, me))
+  match expect_reply(reply) {
+    RowFound(cols) -> Ok(Some(cols))
+    RowAbsent      -> Ok(None)
+    SqlErr(msg)    -> Err(msg)
+    ExecOk(_)      -> Err("protocol: ExecOk reply to QueryRow")
+    ScalarInt(_)   -> Err("protocol: ScalarInt reply to QueryRow")
+  }
+}
+
+# Run a single-Int-column query (COUNT, MAX, scalar SELECT).
+# Returns `Ok(n)` or `Err(msg)`.
+#[unstable]
+pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind])
+  : Result[String, Int] / Actor[SqlMsg] = {
+  let reply = cell.ask(c, (me) => QueryScalar(sql, binds, me))
+  match expect_reply(reply) {
+    ScalarInt(n) -> Ok(n)
+    SqlErr(msg)  -> Err(msg)
+    ExecOk(_)    -> Err("protocol: ExecOk reply to QueryScalar")
+    RowFound(_)  -> Err("protocol: RowFound reply to QueryScalar")
+    RowAbsent    -> Err("protocol: RowAbsent reply to QueryScalar")
+  }
+}
+
+# Tell the cell to close its connection and exit. Fire-and-forget:
+# the caller does not wait for an acknowledgement (the cell exits
+# rather than replying). Call this once at the end of a `with_client`
+# body. After `close`, the client pid is dead; further helper calls
+# park forever on a reply that never comes.
+#[unstable]
+pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] =
+  Actor.send(c, Shutdown)

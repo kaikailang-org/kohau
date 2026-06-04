@@ -4,12 +4,16 @@ DB clients for [kaikai](https://github.com/kaikailang-org/kaikai). The
 persistence substrate that sits between the language's effects and
 the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
-> **Status:** v0.1 SQLite low-level surface shipped
-> (`kohau.sqlite`). Cell-wrapped client + connection pool +
-> restart-on-failure (`kohau.sqlite.client` over ahu) is v0.2.
+> **Status:** SQLite shipped in two layers — the low-level
+> surface (`kohau.sqlite`, raw FFI handles) and the cell-wrapped
+> ergonomic client (`kohau.sqlite.client`, an ahu cell that owns
+> the connection lifecycle and seals `Ffi` from callers). The
+> client gives request/reply query execution with the FFI
+> confined to one fiber. Connection pool, restart-on-failure, a
+> statement cache, and a multi-row query protocol are follow-ups.
 > Postgres is later.
 
-## What v0.1 ships
+## What ships
 
 **`kohau.sqlite`** — low-level SQLite client. One-to-one mapping
 to libsqlite3's C API, bridged through a thin C shim
@@ -30,21 +34,53 @@ means failure for handle-returning functions. Status codes
 follow libsqlite3 convention: `0` is `SQLITE_OK`, `100` is
 `SQLITE_ROW`, `101` is `SQLITE_DONE`.
 
-End-to-end smoke: `tests/sqlite_roundtrip.kai` exercises every
-op against an in-memory database.
+This surface is **usable directly** for scripts, fixtures, and
+one-shot tooling that does not need connection ownership. The
+cell-wrapped client below is what downstream layers (henua) build
+on.
+
+**`kohau.sqlite.client`** — cell-wrapped SQLite client. Wraps a
+single connection inside an [ahu](https://github.com/kaikailang-org/ahu)
+cell (a fiber + typed mailbox + recursive step). The cell **owns
+the connection lifecycle** (opens on spawn, closes on `Shutdown`)
+and is the **sole owner of the `Ffi` boundary** — callers run in
+`Actor[SqlMsg]`, never `Ffi`. The scope-based constructor and the
+typed helpers:
+
+- `with_client(path, body)` — open a connection, spawn the cell,
+  call `body` with the client `Pid[SqlMsg]`. Scope-based because
+  kaikai's region-brand walker forbids a `Pid` from escaping the
+  scope that minted it (the same constraint that gives ahu's
+  `with_cell` its shape).
+- `exec(c, sql, binds)` — no-row statement (DDL, INSERT, DELETE,
+  UPDATE). Returns `Ok(changes)` or `Err(msg)`.
+- `query_row(c, sql, binds)` — ≤1-row query. Returns
+  `Ok(Some(cols))`, `Ok(None)`, or `Err(msg)`.
+- `query_scalar(c, sql, binds)` — single-Int-column query
+  (COUNT, MAX). Returns `Ok(n)` or `Err(msg)`.
+- `close(c)` — tell the cell to close the connection and exit.
+
+Values are bound positionally via `[Bind]` (`BindText` / `BindInt`
+in v1) — the client never concatenates a value into SQL. The
+protocol is high-level on purpose: prepare / step / finalize stay
+inside the cell and never cross the mailbox. Spec:
+`docs/design.md`. End-to-end smoke: `tests/client_roundtrip.kai`
+and `tests/client_errors.kai`.
 
 ## Building
 
-`kai build` does not currently expose link-flag injection, which
-the C shim requires. kohau ships a Makefile that mirrors the
-upstream kaikai stage2 pattern: `kaic2` emits C, then `cc` links
-manually against the shim object and libsqlite3.
+kohau's modules bind libsqlite3 through a C shim (`c/sqlite_shim.{c,h}`)
+and, since the cell-wrapped client, depend on the `ahu` package.
+`kai build` is the driver: it resolves the `ahu` dependency
+(`kai install` populates the cache and writes `kai.lock`), and the
+shim sources + `-lsqlite3` are passed through `CFLAGS`, which the
+`kai` wrapper forwards to its underlying `cc`. This mirrors henua's
+Makefile and the idiomatic `lnds/uira` raylib pattern — no raw
+`kaic2` invocation is needed.
 
 Requirements:
 
-- `kai` and `kaic2` on `PATH`. Homebrew installs put `kaic2`
-  under `<prefix>/libexec/libexec/kaikai/kaic2`; the Makefile
-  autodetects via the `kai` wrapper.
+- `kai` on `PATH`, version 0.83.0+ (git-dep resolution).
 - libsqlite3 headers + library. macOS Homebrew:
   `/opt/homebrew/opt/sqlite/{include,lib}`. Override via
   `make SQLITE_INC=... SQLITE_LIB=...` if the install lives
@@ -53,7 +89,7 @@ Requirements:
 Run the fixtures:
 
 ```sh
-make tier0    # compile every fixture
+make tier0    # compile every fixture (runs kai install if needed)
 make tier1    # compile + run + diff against goldens
 ```
 
