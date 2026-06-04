@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-04
+
 ### Added
 
 - **`kohau/sqlite/client.kai` — cell-wrapped SQLite client.**
