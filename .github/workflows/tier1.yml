@@ -1,0 +1,103 @@
+name: tier1
+
+# Build a fresh checkout of `lnds/kaikai` (HEAD of `main` by default)
+# and run kohau's tier1 fixtures against it. The "fresh" model means
+# every CI run picks up upstream kaikai changes immediately —
+# breakage is surfaced as a failed kohau CI rather than a stale kohau
+# silently passing against an old kaikai. Mirrors ahu's workflow,
+# plus the two things kohau needs that ahu does not:
+#
+#   1. libsqlite3 — kohau's shim links against it. Installed via apt;
+#      the Makefile's macOS-default SQLite paths are overridden to the
+#      Ubuntu system locations on the `make` command line.
+#   2. `kai install` — kohau depends on the `ahu` package (git-dep).
+#      ahu is a public repo, so the clone needs no credentials; this
+#      step populates the cache and writes kai.lock before tier1.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      kaikai_ref:
+        description: kaikai git ref to test against (branch, tag, or SHA)
+        required: false
+        default: main
+
+concurrency:
+  group: tier1-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  KAIKAI_REF: ${{ github.event.inputs.kaikai_ref || 'main' }}
+  # Ubuntu's libsqlite3-dev installs headers under /usr/include and
+  # the library under the multiarch lib dir. Override the Makefile's
+  # macOS Homebrew defaults. (`-lsqlite3` resolves without an explicit
+  # -L on most distros, but we pass it for robustness.)
+  SQLITE_INC: /usr/include
+  SQLITE_LIB: /usr/lib/x86_64-linux-gnu
+
+jobs:
+  tier1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out kohau
+        uses: actions/checkout@v4
+        with:
+          path: kohau
+
+      - name: Check out kaikai (${{ env.KAIKAI_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: lnds/kaikai
+          ref: ${{ env.KAIKAI_REF }}
+          path: kaikai
+          # `lnds/kaikai` is currently a private repository, so the
+          # default GITHUB_TOKEN cannot reach it. Configure a PAT with
+          # `repo:read` scope on `lnds/kaikai` and store it as the
+          # repository secret `KAIKAI_REPO_TOKEN`. When kaikai goes
+          # public this `token` line can be removed.
+          token: ${{ secrets.KAIKAI_REPO_TOKEN }}
+
+      - name: Install libsqlite3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      - name: Toolchain versions
+        run: |
+          cc --version
+          make --version | head -1
+          echo "sqlite3.h: $(ls -1 $SQLITE_INC/sqlite3.h)"
+
+      - name: Record kaikai SHA
+        working-directory: kaikai
+        run: |
+          echo "kaikai SHA: $(git rev-parse HEAD)"
+          echo "kaikai VERSION: $(cat VERSION)"
+
+      - name: Build kaikai (stage0 → stage1 → stage2)
+        working-directory: kaikai
+        run: make all
+
+      - name: Expose `kai` on PATH
+        run: echo "$GITHUB_WORKSPACE/kaikai/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies (ahu git-dep)
+        working-directory: kohau
+        # ahu is a public repo, so this clone needs no credentials.
+        # Writes kai.lock pinning the resolved ahu SHA.
+        run: kai install
+
+      - name: kohau tier0 (compile module + fixtures)
+        working-directory: kohau
+        run: make tier0 SQLITE_INC="$SQLITE_INC" SQLITE_LIB="$SQLITE_LIB"
+
+      - name: kohau tier1 (run fixtures + diff outputs)
+        working-directory: kohau
+        run: make tier1 SQLITE_INC="$SQLITE_INC" SQLITE_LIB="$SQLITE_LIB"
