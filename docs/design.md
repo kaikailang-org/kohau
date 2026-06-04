@@ -151,13 +151,76 @@ statements followed by a succeeding one).
 - **No statement cache.** An LRU `Map[String, Int]` in the cell
   state is the obvious optimisation, deferred until a fixture shows
   the prepare/finalize-per-call cost matters.
-- **No restart-on-failure yet.** Wrapping the cell in ahu's
-  `restartable_cell` needs a reconnection design (re-`open` resets
-  the handle; in-flight statements and open transactions are lost).
-- **No connection pool.** Depends on the restart story.
+- **No restart-on-failure for SQLite.** Deliberate, not deferred —
+  see §*Why restart-on-failure is a not-goal for SQLite* below.
+- **No connection pool.** A pool is a set of supervised connections;
+  it only earns its keep once supervision (restart) does, which —
+  for SQLite — it does not (see below). Revisit with the Postgres
+  driver.
 - **No nested transactions / isolation modes.** `with_tx` ships
   (see below) but is single-level and deferred-`BEGIN` only;
   savepoint nesting and IMMEDIATE/EXCLUSIVE modes are follow-ups.
+
+## Why restart-on-failure is a not-goal for SQLite
+
+The README's foundational principle says connections are
+long-running stateful entities that ahu cells and *restart helpers*
+exist for. The cell part is realised (`with_client`). The restart
+part is **intentionally not** — for SQLite it would be theatre, and
+shipping it would violate "few forms, each with clear intent".
+
+The reasoning, end to end:
+
+1. **SQLite is embedded, not remote.** There is no connection that
+   "drops" the way a TCP connection to Postgres does. The real
+   failure modes are: `SQLITE_BUSY` (lock contention), disk full,
+   file corruption, and a fiber panic from a genuine bug.
+
+2. **Every transient failure is already handled per-operation.**
+   `BUSY` and disk-full come back as `Err(msg)` in `SqlReply` from
+   the operation that hit them; the cell survives (each op prepares
+   and finalizes its own statement — see §*Liveness under failure*).
+   Re-opening the connection does not cure a lock or a full disk, so
+   a restart would not help these.
+
+3. **The only failure a restart *could* catch is a deterministic
+   FFI panic** — and that is exactly the failure you must NOT retry.
+   Re-running the same statement that just segfaulted the fiber
+   re-triggers the same panic. Restarting a deterministic crash is
+   a crash loop, not recovery.
+
+4. **Restart mid-transaction silently breaks atomicity.** If a cell
+   re-opened its connection mid-`with_tx`, the open `BEGIN` is lost
+   and the partial writes either committed or vanished with no
+   signal to the caller. A connection that fails mid-tx must be
+   *poisoned* (the `with_tx` caller gets `Err`), not transparently
+   restarted. Transparent restart and transactional atomicity are
+   in direct tension; atomicity wins (Tier 1: safety beats
+   ergonomics).
+
+5. **There is also an upstream blocker** (see
+   `docs/known-regressions.md`): ahu's `restartable_cell` is built
+   on `with_cell`, which shares one row variable between step and
+   driver. Our step carries `Ffi`; routing it through
+   `restartable_cell` would force the driver — and henua's body
+   above it — to carry `Ffi` too, breaking the FFI seal that is the
+   whole point of the client. A restart helper that hand-spawns the
+   cell with `spawn_actor` (the way `with_client` does) is needed
+   first, and that lives in ahu, not kohau.
+
+**When restart becomes real: the Postgres driver.** A network
+connection genuinely drops, and re-establishing it *is* recovery.
+The correct shape then — confirmed by design review — is that the
+cell's state is the **reconnection recipe** (the connection
+`path`/DSN), never the live handle: "reset to initial" must mean
+"open a fresh connection", which only works if `initial` is the
+recipe, not a dead `Int`. Restart will still be unsafe mid-tx; the
+poison-on-mid-tx-failure rule from point 4 carries over.
+
+Until then, the realistic liveness tool is not restart but a
+**reply timeout** on `ask` (a caller detects a reply that never
+arrives and decides what to do) — an `ask_timeout` follow-up pays
+off sooner than restart for the embedded case.
 
 ## Transactions (`with_tx`)
 

@@ -119,13 +119,20 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ### Follow-ups (not in this release)
 
-- **restart-on-failure.** `with_client` spawns a bare cell. Wrapping
-  it in ahu's `restartable_cell` so a crashed connection respawns
-  needs a reconnection design (re-`open` resets the handle, but
-  in-flight prepared statements and any open transaction are lost) —
-  a real design question, not a wrapper. Tracked for the next lane.
+- **restart-on-failure.** *Resolved as a not-goal for SQLite* after
+  design review (see `docs/design.md` §*Why restart-on-failure is a
+  not-goal for SQLite*): for an embedded DB, transient failures are
+  already handled per-operation, the only failure a restart could
+  catch is a deterministic FFI panic (which must not be retried),
+  and restart mid-`with_tx` would silently break atomicity. There is
+  also an upstream blocker (ahu's `restartable_cell` leaks the step's
+  `Ffi` into the driver — `docs/known-regressions.md`). Restart
+  becomes real with the Postgres driver, where a network connection
+  genuinely drops and the cell's state is the reconnection recipe,
+  not a live handle.
 - **connection pool.** Multiple supervised client cells behind a
-  router. Depends on the restart story landing first.
+  router. A pool only earns its keep once supervision does — i.e.
+  with Postgres, not SQLite.
 - **statement cache.** An LRU `Map[String, Int]` in the cell state.
   Deferred — adds invalidation complexity over raw FFI pointers with
   no fixture demonstrating the cost matters.
