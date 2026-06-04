@@ -434,3 +434,77 @@ pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind])
 #[unstable]
 pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] =
   Actor.send(c, Shutdown)
+
+# Run `body` inside a transaction scope. `BEGIN` on entry; `COMMIT`
+# if `body` returns `Ok`, `ROLLBACK` if it returns `Err`. The result
+# of `body` is returned to the caller — `with_tx` does not invent
+# its own success/failure value, it threads the body's `Result`
+# through (committing or rolling back as a side effect of which arm
+# it is).
+#
+# ## Why the body returns a `Result`, not "any value"
+#
+# kaikai has no exceptions; the failure channel for a transactional
+# body is the value it returns. A body that wants to roll back
+# returns `Err(reason)`; one that wants to commit returns `Ok(value)`.
+# This is honest to the language — there is no hidden control flow
+# that "throws" mid-body and triggers a rollback behind the caller's
+# back. Every `client.exec` / `query_*` call already returns a
+# `Result`, so a body composed of them threads its failures out
+# naturally (match-and-early-`Err`, or the `?`-style propagation when
+# that lands). A body that ignores a failed inner op and returns
+# `Ok` anyway WILL commit — that is the caller's choice, made
+# explicit by the return value.
+#
+# ## Why `tx` is the same pid as `c`
+#
+# SQLite transactions are per-*connection*, not per-statement: `BEGIN`
+# / `COMMIT` / `ROLLBACK` bracket every statement issued on the same
+# connection in between. The cell owns one connection, so the
+# "transaction handle" handed to `body` is just the client pid
+# itself. Passing it as `body`'s argument (rather than letting the
+# body close over `c`) keeps the call site reading like a scope and
+# documents that statements inside `body` are the ones bracketed.
+#
+# ## v1 limitations
+#
+#   - **No nesting.** A `with_tx` inside another `with_tx` on the
+#     same client issues a nested `BEGIN`, which SQLite rejects
+#     ("cannot start a transaction within a transaction"). The inner
+#     `BEGIN` surfaces as `Err` and the inner scope rolls back;
+#     savepoint-based nesting (`SAVEPOINT` / `RELEASE` /
+#     `ROLLBACK TO`) is the follow-up if a fixture needs it.
+#   - **No isolation-level control.** v1 issues a plain `BEGIN`
+#     (SQLite's default deferred transaction). `BEGIN IMMEDIATE` /
+#     `EXCLUSIVE` land via a `with_tx_mode` variant when a consumer
+#     needs the locking semantics.
+#   - **Rollback errors are swallowed.** If `body` returns `Err` and
+#     the subsequent `ROLLBACK` itself fails, the body's original
+#     `Err` is what propagates — the rollback failure is not
+#     surfaced (it would mask the more useful original cause). The
+#     connection may be left in an unexpected state in that rare
+#     case; the cell's per-op statement isolation limits the blast
+#     radius.
+#[unstable]
+pub fn with_tx[R, e](
+  c: Pid[SqlMsg],
+  body: (Pid[SqlMsg]) -> Result[String, R] / Actor[SqlMsg] + e
+) : Result[String, R] / Actor[SqlMsg] + e =
+  match exec(c, "BEGIN", []) {
+    Err(msg) -> Err("BEGIN failed: " ++ msg)
+    Ok(_)    -> {
+      let result = body(c)
+      match result {
+        Ok(_)  -> match exec(c, "COMMIT", []) {
+          Ok(_)    -> result
+          Err(msg) -> Err("COMMIT failed: " ++ msg)
+        }
+        Err(_) -> {
+          # Roll back; the body's original Err is what propagates,
+          # so a rollback failure does not mask the real cause.
+          let _ = exec(c, "ROLLBACK", [])
+          result
+        }
+      }
+    }
+  }

@@ -1,0 +1,6 @@
+commit tx: Ok(1)
+after commit: count=2
+rollback tx: Err
+after rollback: count=2
+mid-fail tx: Err
+after mid-fail: count=2

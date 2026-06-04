@@ -147,8 +147,41 @@ statements followed by a succeeding one).
   `restartable_cell` needs a reconnection design (re-`open` resets
   the handle; in-flight statements and open transactions are lost).
 - **No connection pool.** Depends on the restart story.
-- **No transaction scope.** Wrap with `exec(c, "BEGIN")` /
-  `"COMMIT"`.
+- **No nested transactions / isolation modes.** `with_tx` ships
+  (see below) but is single-level and deferred-`BEGIN` only;
+  savepoint nesting and IMMEDIATE/EXCLUSIVE modes are follow-ups.
+
+## Transactions (`with_tx`)
+
+`with_tx(c, body)` brackets `body` in `BEGIN` / `COMMIT`-or-
+`ROLLBACK`. The design choices, all forced by or aligned with the
+language:
+
+- **The body returns a `Result`; the arm decides commit vs
+  rollback.** kaikai has no exceptions, so the failure channel for a
+  transactional body is its return value: `Err` rolls back, `Ok`
+  commits. There is no hidden control flow — a body that swallows a
+  failed inner op and returns `Ok` *will* commit, by the caller's
+  explicit choice. This is honest in a way an exception-driven
+  "rollback on throw" is not.
+- **`with_tx` threads the body's `Result` out** rather than
+  inventing its own success value. The commit/rollback is a side
+  effect of which arm the body returned; the caller gets back
+  exactly what the body produced (or a `BEGIN`/`COMMIT`-failure
+  `Err`).
+- **`tx` is the same pid as `c`.** SQLite transactions are
+  per-connection, and the cell owns one connection, so the
+  "transaction handle" is the client pid itself. It is passed as the
+  body argument purely to make the scope read clearly and document
+  which statements are bracketed.
+- **Rollback errors do not mask the cause.** If the body returns
+  `Err` and the `ROLLBACK` then fails, the body's original `Err`
+  propagates — the rollback failure is swallowed because the
+  original cause is the more useful signal.
+
+`with_tx` is built on `exec` (BEGIN/COMMIT/ROLLBACK are no-row
+statements), so it inherits the FFI-sealing and `Actor[SqlMsg]`
+properties of the rest of the client — no new effect surface.
 
 ## External dependencies on kaikai
 

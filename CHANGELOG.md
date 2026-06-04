@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ## [Unreleased]
 
+### Added
+
+- **`kohau.sqlite.client.with_tx(c, body)` — transaction scope.**
+  Brackets `body` in `BEGIN` / `COMMIT`-or-`ROLLBACK`: commits if
+  the body returns `Ok`, rolls back if it returns `Err`. The body's
+  `Result` is threaded out to the caller — `with_tx` does not invent
+  its own success value. Honest to the language: there is no hidden
+  control flow that "throws" mid-body; the failure channel is the
+  value the body returns, so a body composed of `client.exec` /
+  `query_*` calls (each already a `Result`) threads its failures out
+  naturally. `tx` is the same pid as `c` because SQLite transactions
+  are per-connection; passing it as the body argument documents
+  which statements are bracketed. v1 is single-level (no nested
+  `with_tx` — SQLite rejects nested `BEGIN`; savepoints are a
+  follow-up) and issues a plain deferred `BEGIN` (no
+  IMMEDIATE/EXCLUSIVE mode control yet). New fixture
+  `tests/client_tx.kai` proves all three routes (commit persists,
+  explicit rollback discards, mid-body failure rolls back the whole
+  tx atomically). tier1 grows from 3 to 4 fixtures, all green under
+  kaikai 0.86.1. Every `pub` stays `#[unstable]`.
+
 ## [0.2.0] — 2026-06-04
 
 ### Added
@@ -86,7 +107,8 @@ project adheres to [Semantic Versioning](https://semver.org/) once
   `query_rows` with a chunked reply (or an ahu `Stream` source)
   lands when a consumer needs `SELECT`-many. henua's `all` is the
   motivating case.
-- **transaction scope.** `with_tx(c, body)`. Today: wrap with
-  `exec(c, "BEGIN")` / `"COMMIT"`.
+- **transaction scope.** `with_tx(c, body)` — *delivered in
+  [Unreleased]*; nested transactions (savepoints) and
+  IMMEDIATE/EXCLUSIVE modes remain follow-ups.
 - **richer binds + columns.** `Real` / `Blob` / `Null` binds and
   typed column reads beyond TEXT/Int.
