@@ -1,0 +1,4 @@
+empty: 0
+one col: 3 [apple] [banana] [cherry]
+two cols: 3 [a|apple] [b|banana] [c|cherry]
+filtered: 2 [banana] [cherry]

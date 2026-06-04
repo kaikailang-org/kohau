@@ -13,6 +13,7 @@ int         kai_sqlite_bind_int(long stmt_handle, int idx, long value);
 int         kai_sqlite_step(long stmt_handle);
 long        kai_sqlite_column_int(long stmt_handle, int col);
 const char *kai_sqlite_column_text(long stmt_handle, int col);
+int         kai_sqlite_column_count(long stmt_handle);
 int         kai_sqlite_reset(long stmt_handle);
 int         kai_sqlite_finalize(long stmt_handle);
 long        kai_sqlite_last_insert_rowid(long handle);

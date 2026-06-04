@@ -122,6 +122,16 @@ const char *kai_sqlite_column_text(long stmt_handle, int col) {
     return (const char *)sqlite3_column_text(stmt, col);
 }
 
+// Number of columns in the result set of a prepared statement.
+// Valid after prepare (before the first step), so the cell can
+// discover how many columns a SELECT returns without the caller
+// declaring it — `SELECT *` and explicit column lists both work.
+// Returns 0 for statements that produce no result set (DDL, INSERT).
+int kai_sqlite_column_count(long stmt_handle) {
+    sqlite3_stmt *stmt = (sqlite3_stmt *)stmt_handle;
+    return sqlite3_column_count(stmt);
+}
+
 // Reset a prepared statement to its initial state so it can be
 // re-stepped (with the same bindings) or re-bound. Returns the
 // SQLite result code from the prior execution, not a new error.

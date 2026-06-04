@@ -9,6 +9,32 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ### Added
 
+- **`kohau.sqlite.client.query_rows(c, sql, binds)` — multi-row
+  query.** Returns every result row's TEXT columns as `[[String]]`
+  in result-set order (empty list for no rows), or `Err(msg)` on a
+  SQLite failure. This unblocks `henua.repository.all` over a
+  persistent store — the consumer that motivated it.
+
+  The column count is discovered at runtime from the prepared
+  statement via a new low-level primitive **`kohau.sqlite.column_count`**
+  (and its shim function `kai_sqlite_column_count` wrapping
+  `sqlite3_column_count`), so `SELECT *` and explicit column lists
+  both work without the caller declaring a width. This was chosen
+  over a caller-supplied `ncols` parameter: a hand-counted width
+  that drifts from the SELECT is a silent bug, whereas
+  `column_count` is a primitive the low-level surface should expose
+  regardless.
+
+  v1 **materialises** the whole result set before replying — the
+  reply is a single `[[String]]`, not a stream. Right for the
+  bounded result sets the layers above kohau need today; a
+  streaming / chunked protocol (or an ahu `Stream` source) for
+  unbounded scans is a follow-up. New fixture
+  `tests/client_query_rows.kai` covers empty / single-column /
+  multi-column / WHERE-filtered-with-bind. tier1 grows from 4 to 5
+  fixtures, green under kaikai 0.86.1. Every new `pub` is
+  `#[unstable]`.
+
 - **`kohau.sqlite.client.with_tx(c, body)` — transaction scope.**
   Brackets `body` in `BEGIN` / `COMMIT`-or-`ROLLBACK`: commits if
   the body returns `Ok`, rolls back if it returns `Err`. The body's
@@ -103,10 +129,10 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 - **statement cache.** An LRU `Map[String, Int]` in the cell state.
   Deferred — adds invalidation complexity over raw FFI pointers with
   no fixture demonstrating the cost matters.
-- **multi-row query protocol.** v1 ships `query_row` (≤1 row); a
-  `query_rows` with a chunked reply (or an ahu `Stream` source)
-  lands when a consumer needs `SELECT`-many. henua's `all` is the
-  motivating case.
+- **multi-row query protocol.** `query_rows` (materialised
+  `[[String]]`) — *delivered in [Unreleased]*; a streaming /
+  chunked reply (or an ahu `Stream` source) for unbounded scans
+  remains a follow-up.
 - **transaction scope.** `with_tx(c, body)` — *delivered in
   [Unreleased]*; nested transactions (savepoints) and
   IMMEDIATE/EXCLUSIVE modes remain follow-ups.
