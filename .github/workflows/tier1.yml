@@ -1,16 +1,17 @@
 name: tier1
 
-# Run kohau's tier1 fixtures against the published kaikai toolchain.
+# Run kohau's tier1 fixtures on GitHub's standard hosted runner.
 #
-# kaikai ships publicly from the `kaikailang-org` Homebrew tap, so CI
-# installs `kai` the same way a developer does — no token, no private
-# clone, no building the compiler from source. (The compiler lives at
-# `kaikailang-org/kaikai`; the user's `lnds/kaikai` is a private
-# exploration repo and is NOT what CI builds against.)
+# Runner: `macos-14` — a GitHub-hosted runner (free for public
+# repos), NOT self-hosted or private. macOS specifically because the
+# public kaikai toolchain only ships a `darwin-arm64` binary today;
+# there is no Linux release, so `ubuntu-latest` would have to build
+# the compiler from source. When kaikai publishes a Linux binary
+# this can move to `ubuntu-latest`.
 #
-# Runs on macOS so the Makefile's Homebrew SQLite paths
-# (/opt/homebrew/opt/sqlite) are correct without overrides, matching
-# the local development environment.
+# kaikai ships publicly from the `kaikailang-org` Homebrew tap, so
+# `kai` is installed the same way a developer installs it — no token,
+# no private clone, no building the compiler from source.
 
 on:
   pull_request:
@@ -47,7 +48,6 @@ jobs:
 
       - name: Resolve dependencies (ahu git-dep)
         # ahu is a public repo, so this clone needs no credentials.
-        # Writes kai.lock pinning the resolved ahu SHA.
         run: kai install
 
       - name: kohau tier0 (compile module + fixtures)
