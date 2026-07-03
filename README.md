@@ -5,7 +5,7 @@ persistence substrate that sits between the language's effects and
 the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
 > **Status:** SQLite shipped in two layers — the low-level
-> surface (`kohau.sqlite`, raw FFI handles) and the cell-wrapped
+> surface (`kohau.sqlite`, typed FFI handles) and the cell-wrapped
 > ergonomic client (`kohau.sqlite.client`, an ahu cell that owns
 > the connection lifecycle and seals `Ffi` from callers). The
 > client gives request/reply query execution with the FFI
@@ -17,23 +17,30 @@ the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
 **`kohau.sqlite`** — low-level SQLite client. One-to-one mapping
 to libsqlite3's C API, bridged through a thin C shim
-(`c/sqlite_shim.{c,h}`) that flattens shapes kaikai's FFI v1
-cannot express (out-parameters, opaque pointers by value).
+(`c/sqlite_shim.{c,h}`) that flattens shapes kaikai's FFI cannot
+express (out-parameters, defaulted destructor/length arguments).
 
 Surface (every decl marked `#[unstable]` for the Hanga Roa
 edition):
 
-- **Lifecycle**: `open(path)`, `close(handle)`.
-- **Single-shot**: `exec(handle, sql)` for DDL / BEGIN / COMMIT.
-- **Prepared statements**: `prepare`, `bind_text`, `bind_int`,
-  `step`, `column_int`, `column_text`, `column_count`, `reset`,
-  `finalize`.
+- **Handles**: `Db` (connection), `Stmt` (prepared statement) —
+  nominal types, so a connection cannot be confused with a
+  statement or a plain `Int`.
+- **Lifecycle**: `open(path) : Option[Db]`, `close(db)`.
+- **Single-shot**: `exec(db, sql)` for DDL / BEGIN / COMMIT.
+- **Prepared statements**: `prepare(db, sql) : Option[Stmt]`,
+  `bind_text`, `bind_int`, `step`, `column_int`, `column_text`,
+  `column_count`, `reset`, `finalize`.
 - **Diagnostics**: `last_insert_rowid`, `changes`, `errmsg`.
 
-Handles flow as `Int` (cast from C pointers in the shim). `0`
-means failure for handle-returning functions. Status codes
-follow libsqlite3 convention: `0` is `SQLITE_OK`, `100` is
-`SQLITE_ROW`, `101` is `SQLITE_DONE`.
+The constructors return `Option` — open/prepare failure is a typed
+absence, not a `0` sentinel. Status codes follow libsqlite3
+convention: `0` is `SQLITE_OK`, `100` is `SQLITE_ROW`, `101` is
+`SQLITE_DONE`. (The handles wrap the shim's pointer-as-`Int`
+representation in nominal records rather than `extern "C" opaque`
+types: an opaque extern type cannot appear in `pub` signatures
+today — see `docs/known-regressions.md`. The wrapper is the
+representation, not the contract.)
 
 This surface is **usable directly** for scripts, fixtures, and
 one-shot tooling that does not need connection ownership. The
@@ -88,7 +95,9 @@ Makefile and the idiomatic `lnds/uira` raylib pattern — no raw
 
 Requirements:
 
-- `kai` on `PATH`, version 0.83.0+ (git-dep resolution).
+- `kai` on `PATH`, version 0.91.0+ (git-dep resolution needs
+  0.83.0+; the FFI v2 fixed-width boundary annotations the extern
+  declarations use need 0.91.0+). Verified against 0.98.0.
 - libsqlite3 headers + library. macOS Homebrew:
   `/opt/homebrew/opt/sqlite/{include,lib}`. Override via
   `make SQLITE_INC=... SQLITE_LIB=...` if the install lives

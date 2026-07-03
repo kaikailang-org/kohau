@@ -22,7 +22,8 @@
 # Requirements on the host:
 #
 #   - `kai` on PATH (`brew install kaikailang-org/kaikai/kaikai`),
-#     version 0.83.0+ for git-dep resolution.
+#     version 0.91.0+ (git-dep resolution needs 0.83.0+; the FFI v2
+#     fixed-width boundary annotations need 0.91.0+).
 #   - libsqlite3 development headers + library. macOS Homebrew ships
 #     them under `/opt/homebrew/opt/sqlite/`; Linux distros ship them
 #     under `/usr/include` and `/usr/lib` typically.
