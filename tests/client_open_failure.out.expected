@@ -1,0 +1,4 @@
+exec: err no connection: open failed
+query_row: err no connection: open failed
+query_scalar: err no connection: open failed
+closed cleanly

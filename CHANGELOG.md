@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ## [Unreleased]
 
+### Changed
+
+- **Typed handles on the low-level surface — `kohau.sqlite` now
+  speaks `Db` / `Stmt`, not `Int`.** Adjusting kohau to the
+  kaikai 0.98 toolchain (FFI v2 shipped in 0.91.0; kohau's surface
+  predated it, verified at 0.86.1):
+
+  - `open(path) : Option[Db]` and `prepare(db, sql) : Option[Stmt]`
+    replace the `Int`-returning forms with their `0`-means-failure
+    sentinel. Failure is a typed absence; a `Db` cannot be passed
+    where a `Stmt` is expected (or vice versa), and every other
+    operation takes the typed handle.
+  - The intended FFI v2 form — `extern "C" opaque Db / Stmt` — is
+    **blocked upstream**: an opaque extern type lowers to a private
+    nominal type and cannot appear in `pub` signatures (documented
+    with repro in `docs/known-regressions.md`). The handles are
+    nominal wrapper records over the shim's pointer-as-`Int`
+    representation instead; when opaque types become exportable the
+    swap is internal to `kohau/sqlite.kai` and the public surface
+    does not change.
+  - The extern declarations adopt FFI v2 **fixed-width boundary
+    annotations**: `I32` where the shim's C type is `int` (result
+    codes, bind/column indexes, `changes`, `column_count`). This
+    closes a latent width mismatch — the old declarations bound C
+    `int` returns as kaikai `Int` (`int64_t`), which read garbage
+    high bits on ABIs that do not zero-extend. The shim's handle
+    and 64-bit-value types move from `long` to `int64_t` for the
+    same exactness.
+  - `kohau.sqlite.client`'s public surface is unchanged (it deals
+    in `Pid[SqlMsg]`). Internally the cell state becomes
+    `Option[Db]`, which also delivers the **typed open-failure
+    path** that was previously a follow-up: when `open` fails the
+    cell replies `SqlErr("no connection: open failed")` to every
+    request instead of running SQLite ops against a `0` handle.
+    New fixture `tests/client_open_failure.kai` drives it (every
+    helper errs typed, `close` still shuts the cell down cleanly).
+
+  BREAKING for direct users of the low-level surface (all decls
+  are `#[unstable]`; henua consumes the client surface, which did
+  not move). tier1 grows from 5 to 6 fixtures, green under kaikai
+  0.98.0 on both backends (`native` and `--backend=c`
+  parity-checked for the low-level fixture).
+
+- **Toolchain baseline: kaikai 0.98.0.** tier1 re-verified; of the
+  two upstream regressions documented at 0.86.1, the transitive
+  `#[unstable]` warnings are resolved and the `awk` stderr noise
+  still reproduces (`docs/known-regressions.md` re-verification
+  notes). Minimum `kai` moves to 0.91.0+ (FFI v2 fixed-width
+  annotations).
+
 ### Added
 
 - **`kohau.sqlite.client.query_rows(c, sql, binds)` — multi-row

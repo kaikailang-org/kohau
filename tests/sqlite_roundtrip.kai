@@ -29,23 +29,24 @@ fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout =
   else { Stdout.print(label ++ ": FAIL got='" ++ got ++ "' want='" ++ want ++ "'") }
 
 # Insert a single (name, count) row via prepared statement.
-fn insert_one(db: Int, name: String, count: Int) : Int / Ffi + Stdout = {
-  let stmt = sqlite.prepare(db, "INSERT INTO items (name, count) VALUES (?, ?)")
-  if stmt == 0 {
-    Stdout.print("prepare INSERT: FAIL")
-    0
-  } else {
-    let _ = sqlite.bind_text(stmt, 1, name)
-    let _ = sqlite.bind_int(stmt, 2, count)
-    let rc = sqlite.step(stmt)
-    let _ = sqlite.finalize(stmt)
-    rc
+fn insert_one(db: Db, name: String, count: Int) : Int / Ffi + Stdout =
+  match sqlite.prepare(db, "INSERT INTO items (name, count) VALUES (?, ?)") {
+    None -> {
+      Stdout.print("prepare INSERT: FAIL")
+      0
+    }
+    Some(stmt) -> {
+      let _ = sqlite.bind_text(stmt, 1, name)
+      let _ = sqlite.bind_int(stmt, 2, count)
+      let rc = sqlite.step(stmt)
+      let _ = sqlite.finalize(stmt)
+      rc
+    }
   }
-}
 
 # Read one row of the SELECT, print "name=N count=K", return 1.
 # Returns 0 on SQLITE_DONE.
-fn read_loop(stmt: Int, n: Int) : Int / Ffi + Stdout = {
+fn read_loop(stmt: Stmt, n: Int) : Int / Ffi + Stdout = {
   let rc = sqlite.step(stmt)
   if rc == 100 {
     let nm = sqlite.column_text(stmt, 0)
@@ -57,7 +58,7 @@ fn read_loop(stmt: Int, n: Int) : Int / Ffi + Stdout = {
   }
 }
 
-fn run_with_db(db: Int) : Int / Console + Ffi = {
+fn run_with_db(db: Db) : Int / Console + Ffi = {
   # ---- DDL ----
   let rc_create = sqlite.exec(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, count INTEGER NOT NULL)")
   check_eq_int("create", rc_create, 0)
@@ -75,18 +76,26 @@ fn run_with_db(db: Int) : Int / Console + Ffi = {
   check_eq_int("changes", sqlite.changes(db), 1)
 
   # ---- SELECT ----
-  let sel = sqlite.prepare(db, "SELECT name, count FROM items ORDER BY id")
-  check_ok("prepare SELECT", sel != 0)
-  let read = read_loop(sel, 1)
-  check_eq_int("rows read", read, 4)
-  let _ = sqlite.finalize(sel)
+  match sqlite.prepare(db, "SELECT name, count FROM items ORDER BY id") {
+    None -> check_ok("prepare SELECT", false)
+    Some(sel) -> {
+      check_ok("prepare SELECT", true)
+      let read = read_loop(sel, 1)
+      check_eq_int("rows read", read, 4)
+      let _ = sqlite.finalize(sel)
+    }
+  }
 
   # ---- single-value SELECT (COUNT) ----
-  let cnt_stmt = sqlite.prepare(db, "SELECT COUNT(*) FROM items")
-  let _ = sqlite.step(cnt_stmt)
-  let total = sqlite.column_int(cnt_stmt, 0)
-  check_eq_int("count(*)", total, 3)
-  let _ = sqlite.finalize(cnt_stmt)
+  match sqlite.prepare(db, "SELECT COUNT(*) FROM items") {
+    None -> check_ok("count(*)", false)
+    Some(cnt_stmt) -> {
+      let _ = sqlite.step(cnt_stmt)
+      let total = sqlite.column_int(cnt_stmt, 0)
+      check_eq_int("count(*)", total, 3)
+      let _ = sqlite.finalize(cnt_stmt)
+    }
+  }
 
   # ---- close ----
   let rc_close = sqlite.close(db)
@@ -95,8 +104,14 @@ fn run_with_db(db: Int) : Int / Console + Ffi = {
   0
 }
 
-fn main() : Int / Console + Ffi = {
-  let db = sqlite.open(":memory:")
-  check_ok("open", db != 0)
-  if db == 0 { 1 } else { run_with_db(db) }
-}
+fn main() : Int / Console + Ffi =
+  match sqlite.open(":memory:") {
+    None -> {
+      check_ok("open", false)
+      1
+    }
+    Some(db) -> {
+      check_ok("open", true)
+      run_with_db(db)
+    }
+  }

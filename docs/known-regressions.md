@@ -8,6 +8,56 @@ and whether it blocks tier1.
 This file follows ahu's convention: bugs found outside kohau's lane
 are documented here, not fixed inline. kohau does not patch kaikai.
 
+## kaikai 0.98.0
+
+### `extern "C" opaque` types cannot appear in `pub` signatures
+
+**Symptom.** An `extern "C" opaque Name` declaration (FFI v2,
+kaikai 0.91.0+) is lowered to a *private* nominal type
+(`lower_extern_opaques` in `stage2/compiler/desugar.kai` emits
+`DType(false, ...)`), and the parser accepts no `pub` on an extern
+type head (`extern "C" pub opaque` is not a form; the comment in
+`parse_decl` says type heads take no `pub`). Any `pub fn` whose
+signature mentions the opaque type is then rejected by the
+pub-signature validator:
+
+```
+error: pub fn `open` exposes non-pub type `Db` from module `sqlite`;
+       mark `Db` as `pub` or remove it from the signature
+```
+
+There is no way to mark it `pub`, so opaque handles only work in
+signatures that are module-private — i.e. single-module programs
+(the shape the FFI v2 fixtures exercise).
+
+**Impact on kohau.** Blocks the natural FFI v2 migration of
+`kohau.sqlite`'s handles to `extern "C" opaque Db / Stmt`: the
+module's entire `pub` surface (`open`, `exec`, `prepare`, ...)
+names the handle types.
+
+**Workaround.** Nominal wrapper records (`pub type Db = { raw: Int }`,
+same for `Stmt`) over the shim's pointer-as-`Int` representation.
+This delivers the typed surface (`Db` ≠ `Stmt` ≠ `Int`,
+`Option`-returning constructors) that opaque handles would give;
+what it does not deliver is unforgeability — a caller can construct
+`Db { raw: n }` from an arbitrary integer (verified: record
+construction and field access work cross-module). When opaque
+extern types can cross a `pub` boundary, the swap is internal to
+`kohau/sqlite.kai`; the public surface does not change.
+
+**Status.** Open upstream, not yet filed. Repro: any two-module
+package where module A declares `extern "C" opaque T` and a
+`pub fn` mentioning `T`.
+
+### Re-verification of the 0.86.1 entries
+
+- **`awk` stderr noise on FFI builds** — still reproduces on
+  0.98.0, unchanged (once per `kai build` with custom `CFLAGS`;
+  cosmetic, tier1 green). See the full entry below.
+- **`#[unstable]` warnings firing transitively** — no longer
+  observed on 0.98.0: a clean `make tier0` emits no unstable
+  warnings. Considered resolved upstream.
+
 ## kaikai 0.86.1
 
 ### `kai build` emits `awk` stderr noise on FFI fixtures
@@ -56,7 +106,9 @@ unstable warnings on the generated-C path for extern decls reached
 fixtures opt in (`sqlite`, `client`, `cell` under `[unstable]`), so
 direct uses are warning-free.
 
-**Status.** Also observed and documented by henua. Open upstream.
+**Status.** Resolved — no longer observed on kaikai 0.98.0 (see the
+re-verification note above). Was also observed and documented by
+henua.
 
 ## ahu
 

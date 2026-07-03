@@ -1,0 +1,55 @@
+# tests/client_open_failure.kai — the typed open-failure path.
+#
+# When `sqlite.open` fails (here: a path inside a directory that
+# does not exist), `with_client` still enters `body` — the cell
+# spawns without a connection — and every request must come back as
+# a *typed* failure over the mailbox, not a crash and not an
+# operation against a dead handle. `close` must still shut the cell
+# down cleanly so `with_client`'s scope can end.
+#
+# Cases:
+#   1. exec on a client whose open failed         -> Err
+#   2. query_row on the same client               -> Err
+#   3. query_scalar on the same client            -> Err
+#   4. close                                      -> clean shutdown
+#      (the fixture reaching its final print IS the assertion)
+#
+# The error text is fixed by kohau ("no connection: open failed"),
+# not by libsqlite3, so the golden can assert the full message.
+
+import actor
+import kohau.sqlite.client
+
+fn show_exec(label: String, r: Result[String, Int]) : Unit / Console =
+  match r {
+    Ok(_)    -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
+  }
+
+fn show_row(label: String, r: Result[String, Option[[String]]]) : Unit / Console =
+  match r {
+    Ok(_)    -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
+  }
+
+fn show_scalar(label: String, r: Result[String, Int]) : Unit / Console =
+  match r {
+    Ok(_)    -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
+  }
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
+  show_exec("exec",
+    client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY)", []))
+  show_row("query_row",
+    client.query_row(c, "SELECT data FROM t WHERE id = ?", [BindText("x")]))
+  show_scalar("query_scalar",
+    client.query_scalar(c, "SELECT COUNT(*) FROM t", []))
+  client.close(c)
+  Stdout.print("closed cleanly")
+}
+
+fn main() : Int / Spawn + Ffi + Console = {
+  with_mailbox { client.with_client("/nonexistent-kohau-dir/db.sqlite", body) }
+  0
+}
