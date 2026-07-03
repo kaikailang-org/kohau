@@ -11,10 +11,10 @@ for SQLite and the decisions behind the cell-wrapped client.
 Every backend driver in kohau exposes two shapes:
 
 1. **Low-level surface** (`kohau.sqlite`) — a one-to-one mapping to
-   the backend's native API (libsqlite3 here), with raw `Int`
-   handles the caller opens, prepares, steps, finalizes, and closes
-   by hand. Every operation carries `Ffi`. This surface is for
-   scripts, fixtures, and one-shot tooling that does not need
+   the backend's native API (libsqlite3 here), with typed `Db` /
+   `Stmt` handles the caller opens, prepares, steps, finalizes, and
+   closes by hand. Every operation carries `Ffi`. This surface is
+   for scripts, fixtures, and one-shot tooling that does not need
    connection ownership.
 
 2. **Cell-wrapped surface** (`kohau.sqlite.client`) — the ergonomic
@@ -37,8 +37,9 @@ prepared statements, and it can fail and need re-establishing.
 That is exactly the shape an `ahu` cell models (a fiber + typed
 mailbox + recursive step function over an immutable state). The
 README's foundational principle — *kohau builds on ahu, not on raw
-kaikai primitives* — is realised here: the connection's `Int`
-handle is the cell's state, and every operation is a message.
+kaikai primitives* — is realised here: the connection handle
+(`Option[Db]`) is the cell's state, and every operation is a
+message.
 
 ### Why `with_client(path, body)` and not `connect(path) : Pid`
 
@@ -148,7 +149,7 @@ statements followed by a succeeding one).
 
 ## Not-goals (v1)
 
-- **No statement cache.** An LRU `Map[String, Int]` in the cell
+- **No statement cache.** An LRU `Map[String, Stmt]` in the cell
   state is the obvious optimisation, deferred until a fixture shows
   the prepare/finalize-per-call cost matters.
 - **No restart-on-failure for SQLite.** Deliberate, not deferred —
