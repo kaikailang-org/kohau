@@ -5,7 +5,7 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
-## [Unreleased]
+## [0.3.0] — 2026-07-03
 
 ### Changed
 
@@ -187,11 +187,11 @@ project adheres to [Semantic Versioning](https://semver.org/) once
   Deferred — adds invalidation complexity over raw FFI pointers with
   no fixture demonstrating the cost matters.
 - **multi-row query protocol.** `query_rows` (materialised
-  `[[String]]`) — *delivered in [Unreleased]*; a streaming /
+  `[[String]]`) — *delivered in [0.3.0]*; a streaming /
   chunked reply (or an ahu `Stream` source) for unbounded scans
   remains a follow-up.
 - **transaction scope.** `with_tx(c, body)` — *delivered in
-  [Unreleased]*; nested transactions (savepoints) and
+  [0.3.0]*; nested transactions (savepoints) and
   IMMEDIATE/EXCLUSIVE modes remain follow-ups.
 - **richer binds + columns.** `Real` / `Blob` / `Null` binds and
   typed column reads beyond TEXT/Int.

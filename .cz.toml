@@ -1,0 +1,12 @@
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.2.0"
+version_files = ["kai.toml:version"]
+tag_format = "v$version"
+major_version_zero = true
+
+# Unlike kaikai, the CHANGELOG is hand-curated (Keep a Changelog
+# prose, not commit-subject bullets), so cz does not touch it on
+# bump: promote the [Unreleased] section manually before running
+# `cz bump`.
+update_changelog_on_bump = false
