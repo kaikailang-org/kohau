@@ -1,5 +1,5 @@
 name = "kohau"
-version = "0.2.0"
+version = "0.3.0"
 edition = "hanga-roa"
 
 [dependencies]
