@@ -16,75 +16,66 @@
 # Trace is deterministic: `:memory:` fresh per run, ORDER BY id.
 
 import actor
+
 import kohau.sqlite.client
 
 # Render a result set as "n: [a|b|c] [d|e|f]" for a stable golden.
 # The rendered rows are appended only when there are rows, so an
 # empty result set prints "n: 0" with no trailing space.
-fn show_rows(label: String, r: Result[String, [[String]]]) : Unit / Console =
-  match r {
-    Err(_)   -> Stdout.print(label ++ ": err")
-    Ok(rows) -> {
-      let n = row_count(rows)
-      if n == 0 {
-        Stdout.print(label ++ ": 0")
-      } else {
-        Stdout.print(label ++ ": " ++ int_to_string(n) ++ " " ++ render_rows(rows))
-      }
+fn show_rows(label: String, r: Result[[[String]], String]) : Unit / Console = match r {
+  Err(_) -> Stdout.print(label ++ ": err")
+  Ok(rows) -> {
+    let n = row_count(rows)
+    if n == 0 {
+      Stdout.print(label ++ ": 0")
+    } else {
+      Stdout.print(label ++ (": " ++ (int_to_string(n) ++ (" " ++ render_rows(rows)))))
     }
   }
+}
 
-fn row_count(rows: [[String]]) : Int =
-  match rows {
-    []          -> 0
-    [_, ...rest] -> 1 + row_count(rest)
-  }
+fn row_count(rows: [[String]]) : Int = match rows {
+  [] -> 0
+  [_, ...rest] -> 1 + row_count(rest)
+}
 
-fn render_rows(rows: [[String]]) : String =
-  match rows {
-    []           -> ""
-    [r]          -> "[" ++ join_pipe(r) ++ "]"
-    [r, ...rest] -> "[" ++ join_pipe(r) ++ "] " ++ render_rows(rest)
-  }
+fn render_rows(rows: [[String]]) : String = match rows {
+  [] -> ""
+  [r] -> "[" ++ (join_pipe(r) ++ "]")
+  [r, ...rest] -> "[" ++ (join_pipe(r) ++ ("] " ++ render_rows(rest)))
+}
 
-fn join_pipe(cols: [String]) : String =
-  match cols {
-    []           -> ""
-    [c]          -> c
-    [c, ...rest] -> c ++ "|" ++ join_pipe(rest)
-  }
+fn join_pipe(cols: [String]) : String = match cols {
+  [] -> ""
+  [c] -> c
+  [c, ...rest] -> c ++ ("|" ++ join_pipe(rest))
+}
 
-fn seed(c: Pid[SqlMsg], id: String, data: String) : Unit / Actor[SqlMsg] = {
-  let _ = client.exec(c, "INSERT INTO t (id, data) VALUES (?, ?)",
-    [BindText(id), BindText(data)])
+fn seed(c: Pid[SqlMsg], id: String, data: String) : Unit / Actor[SqlMsg] {
+  let _ = client.exec(c, "INSERT INTO t (id, data) VALUES (?, ?)", [BindText(id), BindText(data)])
   ()
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   let _ = client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY, data TEXT NOT NULL)", [])
-
   # ---- 1. empty table ----
   show_rows("empty", client.query_rows(c, "SELECT data FROM t ORDER BY id", []))
-
   # seed three rows
   seed(c, "a", "apple")
   seed(c, "b", "banana")
   seed(c, "c", "cherry")
-
   # ---- 2. single column, all rows ----
   show_rows("one col", client.query_rows(c, "SELECT data FROM t ORDER BY id", []))
-
   # ---- 3. multiple columns ----
   show_rows("two cols", client.query_rows(c, "SELECT id, data FROM t ORDER BY id", []))
-
   # ---- 4. WHERE-filtered with a bind ----
-  show_rows("filtered", client.query_rows(c,
-    "SELECT data FROM t WHERE id > ? ORDER BY id", [BindText("a")]))
-
+  show_rows("filtered", client.query_rows(c, "SELECT data FROM t WHERE id > ? ORDER BY id", [BindText("a")]))
   client.close(c)
 }
 
-fn main() : Int / Spawn + Ffi + Console = {
-  with_mailbox { client.with_client(":memory:", body) }
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
   0
 }
