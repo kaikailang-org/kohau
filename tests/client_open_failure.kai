@@ -18,38 +18,35 @@
 # not by libsqlite3, so the golden can assert the full message.
 
 import actor
+
 import kohau.sqlite.client
 
-fn show_exec(label: String, r: Result[String, Int]) : Unit / Console =
-  match r {
-    Ok(_)    -> Stdout.print(label ++ ": ok")
-    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
-  }
+fn show_exec(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(_) -> Stdout.print(label ++ ": ok")
+  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+}
 
-fn show_row(label: String, r: Result[String, Option[[String]]]) : Unit / Console =
-  match r {
-    Ok(_)    -> Stdout.print(label ++ ": ok")
-    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
-  }
+fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+  Ok(_) -> Stdout.print(label ++ ": ok")
+  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+}
 
-fn show_scalar(label: String, r: Result[String, Int]) : Unit / Console =
-  match r {
-    Ok(_)    -> Stdout.print(label ++ ": ok")
-    Err(msg) -> Stdout.print(label ++ ": err " ++ msg)
-  }
+fn show_scalar(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(_) -> Stdout.print(label ++ ": ok")
+  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+}
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
-  show_exec("exec",
-    client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY)", []))
-  show_row("query_row",
-    client.query_row(c, "SELECT data FROM t WHERE id = ?", [BindText("x")]))
-  show_scalar("query_scalar",
-    client.query_scalar(c, "SELECT COUNT(*) FROM t", []))
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  show_exec("exec", client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY)", []))
+  show_row("query_row", client.query_row(c, "SELECT data FROM t WHERE id = ?", [BindText("x")]))
+  show_scalar("query_scalar", client.query_scalar(c, "SELECT COUNT(*) FROM t", []))
   client.close(c)
   Stdout.print("closed cleanly")
 }
 
-fn main() : Int / Spawn + Ffi + Console = {
-  with_mailbox { client.with_client("/nonexistent-kohau-dir/db.sqlite", body) }
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client("/nonexistent-kohau-dir/db.sqlite", body)
+  })
   0
 }

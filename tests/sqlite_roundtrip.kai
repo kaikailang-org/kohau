@@ -15,54 +15,57 @@
 
 import kohau.sqlite
 
-fn check_ok(label: String, ok: Bool) : Unit / Stdout =
-  if ok { Stdout.print(label ++ ": ok") }
-  else  { Stdout.print(label ++ ": FAIL") }
+fn check_ok(label: String, ok: Bool) : Unit / Stdout = if ok {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ ": FAIL")
+}
 
-fn check_eq_int(label: String, got: Int, want: Int) : Unit / Stdout =
-  if got == want { Stdout.print(label ++ ": ok") }
-  else { Stdout.print(label ++ ": FAIL got=" ++ int_to_string(got) ++
-                            " want=" ++ int_to_string(want)) }
+fn check_eq_int(label: String, got: Int, want: Int) : Unit / Stdout = if got == want {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ (": FAIL got=" ++ (int_to_string(got) ++ (" want=" ++ int_to_string(want)))))
+}
 
-fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout =
-  if got == want { Stdout.print(label ++ ": ok") }
-  else { Stdout.print(label ++ ": FAIL got='" ++ got ++ "' want='" ++ want ++ "'") }
+fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout = if got == want {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ (": FAIL got='" ++ (got ++ ("' want='" ++ (want ++ "'")))))
+}
 
 # Insert a single (name, count) row via prepared statement.
-fn insert_one(db: Db, name: String, count: Int) : Int / Ffi + Stdout =
-  match sqlite.prepare(db, "INSERT INTO items (name, count) VALUES (?, ?)") {
-    None -> {
-      Stdout.print("prepare INSERT: FAIL")
-      0
-    }
-    Some(stmt) -> {
-      let _ = sqlite.bind_text(stmt, 1, name)
-      let _ = sqlite.bind_int(stmt, 2, count)
-      let rc = sqlite.step(stmt)
-      let _ = sqlite.finalize(stmt)
-      rc
-    }
+fn insert_one(db: Db, name: String, count: Int) : Int / Ffi + Stdout = match sqlite.prepare(db, "INSERT INTO items (name, count) VALUES (?, ?)") {
+  None -> {
+    Stdout.print("prepare INSERT: FAIL")
+    0
   }
+  Some(stmt) -> {
+    let _ = sqlite.bind_text(stmt, 1, name)
+    let _ = sqlite.bind_int(stmt, 2, count)
+    let rc = sqlite.step(stmt)
+    let _ = sqlite.finalize(stmt)
+    rc
+  }
+}
 
 # Read one row of the SELECT, print "name=N count=K", return 1.
 # Returns 0 on SQLITE_DONE.
-fn read_loop(stmt: Stmt, n: Int) : Int / Ffi + Stdout = {
+fn read_loop(stmt: Stmt, n: Int) : Int / Ffi + Stdout {
   let rc = sqlite.step(stmt)
   if rc == 100 {
     let nm = sqlite.column_text(stmt, 0)
     let ct = sqlite.column_int(stmt, 1)
-    Stdout.print("row " ++ int_to_string(n) ++ ": " ++ nm ++ "=" ++ int_to_string(ct))
+    Stdout.print("row " ++ (int_to_string(n) ++ (": " ++ (nm ++ ("=" ++ int_to_string(ct))))))
     read_loop(stmt, n + 1)
   } else {
     n
   }
 }
 
-fn run_with_db(db: Db) : Int / Console + Ffi = {
+fn run_with_db(db: Db) : Int / Console + Ffi {
   # ---- DDL ----
   let rc_create = sqlite.exec(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, count INTEGER NOT NULL)")
   check_eq_int("create", rc_create, 0)
-
   # ---- INSERTs via prepared statements ----
   let rc1 = insert_one(db, "alpha", 10)
   check_eq_int("insert alpha", rc1, 101)
@@ -70,11 +73,9 @@ fn run_with_db(db: Db) : Int / Console + Ffi = {
   check_eq_int("insert bravo", rc2, 101)
   let rc3 = insert_one(db, "charlie", 30)
   check_eq_int("insert charlie", rc3, 101)
-
   # ---- diagnostics ----
   check_eq_int("last rowid", sqlite.last_insert_rowid(db), 3)
   check_eq_int("changes", sqlite.changes(db), 1)
-
   # ---- SELECT ----
   match sqlite.prepare(db, "SELECT name, count FROM items ORDER BY id") {
     None -> check_ok("prepare SELECT", false)
@@ -85,7 +86,6 @@ fn run_with_db(db: Db) : Int / Console + Ffi = {
       let _ = sqlite.finalize(sel)
     }
   }
-
   # ---- single-value SELECT (COUNT) ----
   match sqlite.prepare(db, "SELECT COUNT(*) FROM items") {
     None -> check_ok("count(*)", false)
@@ -96,22 +96,19 @@ fn run_with_db(db: Db) : Int / Console + Ffi = {
       let _ = sqlite.finalize(cnt_stmt)
     }
   }
-
   # ---- close ----
   let rc_close = sqlite.close(db)
   check_eq_int("close", rc_close, 0)
-
   0
 }
 
-fn main() : Int / Console + Ffi =
-  match sqlite.open(":memory:") {
-    None -> {
-      check_ok("open", false)
-      1
-    }
-    Some(db) -> {
-      check_ok("open", true)
-      run_with_db(db)
-    }
+fn main() : Int / Console + Ffi = match sqlite.open(":memory:") {
+  None -> {
+    check_ok("open", false)
+    1
   }
+  Some(db) -> {
+    check_ok("open", true)
+    run_with_db(db)
+  }
+}

@@ -1,6 +1,6 @@
 name = "kohau"
 version = "0.3.0"
-edition = "hanga-roa"
+edition = "orongo"
 
 [dependencies]
 

@@ -18,65 +18,61 @@
 # Trace is deterministic: `:memory:` is fresh per run.
 
 import actor
+
 import kohau.sqlite.client
 
-fn count(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] =
-  match client.query_scalar(c, "SELECT COUNT(*) FROM t", []) {
-    Ok(n)  -> n
-    Err(_) -> -1
-  }
+fn count(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM t", []) {
+  Ok(n) -> n
+  Err(_) -> -1
+}
 
-fn show_tx(label: String, r: Result[String, Int]) : Unit / Console =
-  match r {
-    Ok(n)  -> Stdout.print(label ++ ": Ok(" ++ int_to_string(n) ++ ")")
-    Err(_) -> Stdout.print(label ++ ": Err")
-  }
+fn show_tx(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(n) -> Stdout.print(label ++ (": Ok(" ++ (int_to_string(n) ++ ")")))
+  Err(_) -> Stdout.print(label ++ ": Err")
+}
 
-fn show_count(label: String, n: Int) : Unit / Console =
-  Stdout.print(label ++ ": count=" ++ int_to_string(n))
+fn show_count(label: String, n: Int) : Unit / Console = Stdout.print(label ++ (": count=" ++ int_to_string(n)))
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   let _ = client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY, data TEXT NOT NULL)", [])
-
   # ---- 1. commit path ----
   # Body returns Ok(2) — the value of the last insert's change count,
   # threaded out by with_tx. Both rows persist.
-  let tx1 = client.with_tx(c, (tx) => {
+  let tx1 = client.with_tx(c, tx => {
     match client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("a"), BindText("1")]) {
       Err(m) -> Err(m)
-      Ok(_)  -> client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("b"), BindText("2")])
+      Ok(_) -> client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("b"), BindText("2")])
     }
   })
   show_tx("commit tx", tx1)
   show_count("after commit", count(c))
-
   # ---- 2. explicit rollback ----
   # Body inserts a row but deliberately returns Err — the insert is
   # rolled back, count stays at 2.
-  let tx2 = client.with_tx(c, (tx) => {
+  let tx2 = client.with_tx(c, tx => {
     let _ = client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("c"), BindText("3")])
     Err("caller aborts the tx")
   })
   show_tx("rollback tx", tx2)
   show_count("after rollback", count(c))
-
   # ---- 3. mid-body failure rollback ----
   # First insert succeeds; second is a constraint violation (duplicate
   # primary key 'a' from tx1). The body propagates that Err, so the
   # whole tx rolls back — the good first insert ('d') does NOT persist.
-  let tx3 = client.with_tx(c, (tx) => {
+  let tx3 = client.with_tx(c, tx => {
     match client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("d"), BindText("4")]) {
       Err(m) -> Err(m)
-      Ok(_)  -> client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("a"), BindText("dup")])
+      Ok(_) -> client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("a"), BindText("dup")])
     }
   })
   show_tx("mid-fail tx", tx3)
   show_count("after mid-fail", count(c))
-
   client.close(c)
 }
 
-fn main() : Int / Spawn + Ffi + Console = {
-  with_mailbox { client.with_client(":memory:", body) }
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
   0
 }

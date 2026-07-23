@@ -103,9 +103,13 @@ extern "C" fn kai_sqlite_close(h: Int) : I32 / Ffi
 # in-memory database. Returns `Some(db)` on success, `None` on
 # failure.
 #[unstable]
-pub fn open(path: String) : Option[Db] / Ffi = {
+pub fn open(path: String) : Option[Db] / Ffi {
   let h = kai_sqlite_open(path)
-  if h == 0 { None } else { Some(Db { raw: h }) }
+  if h == 0 {
+    None
+  } else {
+    Some(Db { raw: h })
+  }
 }
 
 # Close the connection. Returns `SQLITE_OK` on success. Every `open`
@@ -148,9 +152,13 @@ extern "C" fn kai_sqlite_finalize(stmt: Int) : I32 / Ffi
 # success, `None` on failure (`errmsg` on the connection carries the
 # cause).
 #[unstable]
-pub fn prepare(h: Db, sql: String) : Option[Stmt] / Ffi = {
+pub fn prepare(h: Db, sql: String) : Option[Stmt] / Ffi {
   let s = kai_sqlite_prepare(h.raw, sql)
-  if s == 0 { None } else { Some(Stmt { raw: s }) }
+  if s == 0 {
+    None
+  } else {
+    Some(Stmt { raw: s })
+  }
 }
 
 # Bind a text value to a parameter (1-indexed per SQLite's
@@ -158,14 +166,12 @@ pub fn prepare(h: Db, sql: String) : Option[Stmt] / Ffi = {
 # copied internally by SQLite, so the caller's string can be
 # dropped after the call.
 #[unstable]
-pub fn bind_text(stmt: Stmt, idx: Int, value: String) : Int / Ffi =
-  kai_sqlite_bind_text(stmt.raw, idx, value)
+pub fn bind_text(stmt: Stmt, idx: Int, value: String) : Int / Ffi = kai_sqlite_bind_text(stmt.raw, idx, value)
 
 # Bind an integer value to a parameter (1-indexed). Returns
 # `SQLITE_OK` on success.
 #[unstable]
-pub fn bind_int(stmt: Stmt, idx: Int, value: Int) : Int / Ffi =
-  kai_sqlite_bind_int(stmt.raw, idx, value)
+pub fn bind_int(stmt: Stmt, idx: Int, value: Int) : Int / Ffi = kai_sqlite_bind_int(stmt.raw, idx, value)
 
 # Advance the statement. Returns:
 #   - `SQLITE_ROW` (100): a row is available; read with `column_*`.
@@ -177,16 +183,14 @@ pub fn step(stmt: Stmt) : Int / Ffi = kai_sqlite_step(stmt.raw)
 # Read an integer column from the current row (0-indexed).
 # Returns 0 if the column is NULL or not numeric.
 #[unstable]
-pub fn column_int(stmt: Stmt, col: Int) : Int / Ffi =
-  kai_sqlite_column_int(stmt.raw, col)
+pub fn column_int(stmt: Stmt, col: Int) : Int / Ffi = kai_sqlite_column_int(stmt.raw, col)
 
 # Read a text column from the current row (0-indexed). The
 # pointer is valid until the next step / finalize on the same
 # statement — the kaikai-side String copies the bytes out
 # automatically as part of the FFI boundary.
 #[unstable]
-pub fn column_text(stmt: Stmt, col: Int) : String / Ffi =
-  kai_sqlite_column_text(stmt.raw, col)
+pub fn column_text(stmt: Stmt, col: Int) : String / Ffi = kai_sqlite_column_text(stmt.raw, col)
 
 # Number of columns in the statement's result set. Valid after
 # `prepare` (before the first `step`), so callers can discover how
@@ -194,8 +198,7 @@ pub fn column_text(stmt: Stmt, col: Int) : String / Ffi =
 # `SELECT *` and explicit column lists work. Returns `0` for
 # statements with no result set (DDL, INSERT/UPDATE/DELETE).
 #[unstable]
-pub fn column_count(stmt: Stmt) : Int / Ffi =
-  kai_sqlite_column_count(stmt.raw)
+pub fn column_count(stmt: Stmt) : Int / Ffi = kai_sqlite_column_count(stmt.raw)
 
 # Reset a prepared statement so it can be re-stepped or re-bound.
 # Returns the SQLite result code from the prior execution.
@@ -219,8 +222,7 @@ extern "C" fn kai_sqlite_errmsg(h: Int) : String / Ffi
 # rowid of the most recently inserted row on this connection.
 # Returns 0 if no insert has happened.
 #[unstable]
-pub fn last_insert_rowid(h: Db) : Int / Ffi =
-  kai_sqlite_last_insert_rowid(h.raw)
+pub fn last_insert_rowid(h: Db) : Int / Ffi = kai_sqlite_last_insert_rowid(h.raw)
 
 # Number of rows changed by the most recent INSERT / UPDATE /
 # DELETE on this connection.

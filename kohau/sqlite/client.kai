@@ -106,8 +106,11 @@
 # as the restart story and the multi-row protocol land.
 
 import spawn
+
 import actor
+
 import ahu.cell
+
 import kohau.sqlite
 
 # ---- protocol ----
@@ -174,85 +177,88 @@ pub type SqlMsg
 
 # Bind one positional value onto a prepared statement. Returns the
 # SQLite rc (0 == SQLITE_OK).
-fn apply_bind(stmt: Stmt, idx: Int, b: Bind) : Int / Ffi =
-  match b {
-    BindText(s) -> sqlite.bind_text(stmt, idx, s)
-    BindInt(n)  -> sqlite.bind_int(stmt, idx, n)
-  }
+fn apply_bind(stmt: Stmt, idx: Int, b: Bind) : Int / Ffi = match b {
+  BindText(s) -> sqlite.bind_text(stmt, idx, s)
+  BindInt(n) -> sqlite.bind_int(stmt, idx, n)
+}
 
 # Bind a whole list of positional values, starting at index `idx`.
 # Stops and returns the first non-OK rc; returns 0 if all bind
 # clean. Recursion (no loop) keeps it tail-shaped.
-fn apply_binds(stmt: Stmt, idx: Int, binds: [Bind]) : Int / Ffi =
-  match binds {
-    []         -> 0
-    [b, ...bs] -> {
-      let rc = apply_bind(stmt, idx, b)
-      if rc != 0 { rc } else { apply_binds(stmt, idx + 1, bs) }
+fn apply_binds(stmt: Stmt, idx: Int, binds: [Bind]) : Int / Ffi = match binds {
+  [] -> 0
+  [b, ...bs] -> {
+    let rc = apply_bind(stmt, idx, b)
+    if rc != 0 {
+      rc
+    } else {
+      apply_binds(stmt, idx + 1, bs)
     }
   }
+}
 
 # Read the first `n` TEXT columns of the current row into a list.
 # Builds the list head-first via recursion.
-fn read_text_cols(stmt: Stmt, col: Int, n: Int) : [String] / Ffi =
-  if col >= n { [] }
-  else {
-    let v = sqlite.column_text(stmt, col)
-    [v, ...read_text_cols(stmt, col + 1, n)]
-  }
+fn read_text_cols(stmt: Stmt, col: Int, n: Int) : [String] / Ffi = if col >= n {
+  []
+} else {
+  let v = sqlite.column_text(stmt, col)
+  [v, ...read_text_cols(stmt, col + 1, n)]
+}
 
 # Execute a no-row statement: prepare, bind, step once, finalize.
 # Returns the pid-free reply payload to send back. Atomic — the
 # statement is fully consumed before this returns.
-fn run_exec(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi =
-  match sqlite.prepare(db, sql) {
-    None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
-    Some(stmt) -> {
-      let rc_bind = apply_binds(stmt, 1, binds)
-      if rc_bind != 0 {
-        let _ = sqlite.finalize(stmt)
-        SqlErr("bind failed: " ++ sqlite.errmsg(db))
+fn run_exec(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
+  None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  Some(stmt) -> {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      let changed = sqlite.changes(db)
+      let _ = sqlite.finalize(stmt)
+      # SQLITE_DONE (101) is success for a no-row statement.
+      if rc_step == 101 {
+        ExecOk(changed)
       } else {
-        let rc_step = sqlite.step(stmt)
-        let changed = sqlite.changes(db)
+        SqlErr("step failed: " ++ sqlite.errmsg(db))
+      }
+    }
+  }
+}
+
+# Execute a ≤1-row statement. The `ncols` argument tells the cell
+# how many columns to read off the row. Returns RowFound(cols),
+# RowAbsent, or SqlErr.
+fn run_query_row(db: Db, sql: String, binds: [Bind], ncols: Int) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
+  None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  Some(stmt) -> {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      # SQLITE_ROW (100): a row is available.
+      if rc_step == 100 {
+        let cols = read_text_cols(stmt, 0, ncols)
         let _ = sqlite.finalize(stmt)
-        # SQLITE_DONE (101) is success for a no-row statement.
+        RowFound(cols)
+      } else {
+        let _ = sqlite.finalize(stmt)
+        # SQLITE_DONE (101): no rows; anything else is an error.
         if rc_step == 101 {
-          ExecOk(changed)
+          RowAbsent
         } else {
           SqlErr("step failed: " ++ sqlite.errmsg(db))
         }
       }
     }
   }
-
-# Execute a ≤1-row statement. The `ncols` argument tells the cell
-# how many columns to read off the row. Returns RowFound(cols),
-# RowAbsent, or SqlErr.
-fn run_query_row(db: Db, sql: String, binds: [Bind], ncols: Int) : SqlReply / Ffi =
-  match sqlite.prepare(db, sql) {
-    None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
-    Some(stmt) -> {
-      let rc_bind = apply_binds(stmt, 1, binds)
-      if rc_bind != 0 {
-        let _ = sqlite.finalize(stmt)
-        SqlErr("bind failed: " ++ sqlite.errmsg(db))
-      } else {
-        let rc_step = sqlite.step(stmt)
-        # SQLITE_ROW (100): a row is available.
-        if rc_step == 100 {
-          let cols = read_text_cols(stmt, 0, ncols)
-          let _ = sqlite.finalize(stmt)
-          RowFound(cols)
-        } else {
-          let _ = sqlite.finalize(stmt)
-          # SQLITE_DONE (101): no rows; anything else is an error.
-          if rc_step == 101 { RowAbsent }
-          else { SqlErr("step failed: " ++ sqlite.errmsg(db)) }
-        }
-      }
-    }
-  }
+}
 
 # Step a prepared statement to exhaustion, accumulating every row's
 # TEXT columns. `ncols` is read once from `sqlite.column_count` and
@@ -260,8 +266,7 @@ fn run_query_row(db: Db, sql: String, binds: [Bind], ncols: Int) : SqlReply / Ff
 # (prepended head-first for O(1) per row); the caller reverses once.
 # Returns `Ok(reversed_rows)` on a clean SQLITE_DONE, or `Err(msg)`
 # if a `step` returns anything other than ROW/DONE mid-iteration.
-fn collect_rows(db: Db, stmt: Stmt, ncols: Int, acc: [[String]])
-  : Result[String, [[String]]] / Ffi = {
+fn collect_rows(db: Db, stmt: Stmt, ncols: Int, acc: [[String]]) : Result[[[String]], String] / Ffi {
   let rc = sqlite.step(stmt)
   # SQLITE_ROW (100): a row is available; read it and recurse.
   if rc == 100 {
@@ -278,75 +283,70 @@ fn collect_rows(db: Db, stmt: Stmt, ncols: Int, acc: [[String]])
 # Reverse a list of rows. Local rather than a stdlib import to keep
 # the module's dependency surface minimal (the same discipline the
 # join/split helpers in henua's adapter follow).
-fn reverse_rows(xs: [[String]], acc: [[String]]) : [[String]] =
-  match xs {
-    []         -> acc
-    [x, ...rest] -> reverse_rows(rest, [x, ...acc])
-  }
+fn reverse_rows(xs: [[String]], acc: [[String]]) : [[String]] = match xs {
+  [] -> acc
+  [x, ...rest] -> reverse_rows(rest, [x, ...acc])
+}
 
 # Execute a multi-row statement. Discovers the column count from the
 # prepared statement (`sqlite.column_count`), then steps to
 # exhaustion. Returns RowsFound(rows) — possibly empty — or SqlErr.
-fn run_query_rows(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi =
-  match sqlite.prepare(db, sql) {
-    None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
-    Some(stmt) -> {
-      let rc_bind = apply_binds(stmt, 1, binds)
-      if rc_bind != 0 {
-        let _ = sqlite.finalize(stmt)
-        SqlErr("bind failed: " ++ sqlite.errmsg(db))
-      } else {
-        # column_count is valid after prepare, before the first step.
-        let ncols  = sqlite.column_count(stmt)
-        let result = collect_rows(db, stmt, ncols, [])
-        let _ = sqlite.finalize(stmt)
-        match result {
-          Ok(rows) -> RowsFound(rows)
-          Err(msg) -> SqlErr(msg)
-        }
+fn run_query_rows(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
+  None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  Some(stmt) -> {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      # column_count is valid after prepare, before the first step.
+      let ncols = sqlite.column_count(stmt)
+      let result = collect_rows(db, stmt, ncols, [])
+      let _ = sqlite.finalize(stmt)
+      match result {
+        Ok(rows) -> RowsFound(rows)
+        Err(msg) -> SqlErr(msg)
       }
     }
   }
+}
 
 # Execute a single-Int-column statement (COUNT, MAX, scalar SELECT).
-fn run_query_scalar(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi =
-  match sqlite.prepare(db, sql) {
-    None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
-    Some(stmt) -> {
-      let rc_bind = apply_binds(stmt, 1, binds)
-      if rc_bind != 0 {
+fn run_query_scalar(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
+  None -> SqlErr("prepare failed: " ++ sqlite.errmsg(db))
+  Some(stmt) -> {
+    let rc_bind = apply_binds(stmt, 1, binds)
+    if rc_bind != 0 {
+      let _ = sqlite.finalize(stmt)
+      SqlErr("bind failed: " ++ sqlite.errmsg(db))
+    } else {
+      let rc_step = sqlite.step(stmt)
+      if rc_step == 100 {
+        let n = sqlite.column_int(stmt, 0)
         let _ = sqlite.finalize(stmt)
-        SqlErr("bind failed: " ++ sqlite.errmsg(db))
+        ScalarInt(n)
       } else {
-        let rc_step = sqlite.step(stmt)
-        if rc_step == 100 {
-          let n = sqlite.column_int(stmt, 0)
-          let _ = sqlite.finalize(stmt)
-          ScalarInt(n)
-        } else {
-          let _ = sqlite.finalize(stmt)
-          SqlErr("step failed: " ++ sqlite.errmsg(db))
-        }
+        let _ = sqlite.finalize(stmt)
+        SqlErr("step failed: " ++ sqlite.errmsg(db))
       }
     }
   }
+}
 
 # Run `op` against the live connection, or reply the typed
 # open-failure when the cell was spawned without one (see
 # `with_client` on the open-failure path).
-fn with_conn(db: Option[Db], op: (Db) -> SqlReply / Ffi) : SqlReply / Ffi =
-  match db {
-    Some(d) -> op(d)
-    None    -> SqlErr("no connection: open failed")
-  }
+fn with_conn(db: Option[Db], op: (Db) -> SqlReply / Ffi) : SqlReply / Ffi = match db {
+  Some(d) -> op(d)
+  None -> SqlErr("no connection: open failed")
+}
 
 # Close the connection if the cell holds one. Returns the SQLite rc
 # (`SQLITE_OK` when there was nothing to close).
-fn close_conn(db: Option[Db]) : Int / Ffi =
-  match db {
-    Some(d) -> sqlite.close(d)
-    None    -> 0
-  }
+fn close_conn(db: Option[Db]) : Int / Ffi = match db {
+  Some(d) -> sqlite.close(d)
+  None -> 0
+}
 
 # The cell's step function. State is the connection handle — `None`
 # when the open failed, so every request replies a typed `SqlErr`
@@ -359,43 +359,43 @@ fn close_conn(db: Option[Db]) : Int / Ffi =
 # `QueryRows` discovers its column count at runtime via
 # `sqlite.column_count`, so it handles arbitrary SELECTs (including
 # `SELECT *`) without the caller declaring a width.
-fn sql_step(db: Option[Db], msg: SqlMsg) : StepResult[Option[Db]] / Actor[SqlMsg] + Ffi =
-  match msg {
-    Exec(sql, binds, reply_to) -> {
-      Actor.send(reply_to, Reply(with_conn(db, (d) => run_exec(d, sql, binds))))
-      cell.keep(db)
-    }
-    QueryRow(sql, binds, reply_to) -> {
-      Actor.send(reply_to, Reply(with_conn(db, (d) => run_query_row(d, sql, binds, 1))))
-      cell.keep(db)
-    }
-    QueryRows(sql, binds, reply_to) -> {
-      Actor.send(reply_to, Reply(with_conn(db, (d) => run_query_rows(d, sql, binds))))
-      cell.keep(db)
-    }
-    QueryScalar(sql, binds, reply_to) -> {
-      Actor.send(reply_to, Reply(with_conn(db, (d) => run_query_scalar(d, sql, binds))))
-      cell.keep(db)
-    }
-    Shutdown -> {
-      let _ = close_conn(db)
-      cell.cell_done()
-    }
-    # A `Reply` never arrives at the cell's own mailbox; if one does
-    # (a misrouted message), ignore it and keep running.
-    Reply(_) -> cell.keep(db)
+fn sql_step(db: Option[Db], msg: SqlMsg) : StepResult[Option[Db]] / Actor[SqlMsg] + Ffi = match msg {
+  Exec(sql, binds, reply_to) -> {
+    Actor.send(reply_to, Reply(with_conn(db, d => run_exec(d, sql, binds))))
+    cell.keep(db)
   }
+  QueryRow(sql, binds, reply_to) -> {
+    Actor.send(reply_to, Reply(with_conn(db, d => run_query_row(d, sql, binds, 1))))
+    cell.keep(db)
+  }
+  QueryRows(sql, binds, reply_to) -> {
+    Actor.send(reply_to, Reply(with_conn(db, d => run_query_rows(d, sql, binds))))
+    cell.keep(db)
+  }
+  QueryScalar(sql, binds, reply_to) -> {
+    Actor.send(reply_to, Reply(with_conn(db, d => run_query_scalar(d, sql, binds))))
+    cell.keep(db)
+  }
+  Shutdown -> {
+    let _ = close_conn(db)
+    cell.cell_done()
+  }
+  Reply(_) -> 
+  # A `Reply` never arrives at the cell's own mailbox; if one does
+  # (a misrouted message), ignore it and keep running.
+  cell.keep(db)
+}
 
 # The cell dispatch loop, spawned as its own fiber by `with_client`.
 # Mirrors ahu's internal `cell_loop` but lives here so `with_client`
 # can hand-spawn it (see the module header on why `with_cell` is not
 # used: it shares one row variable between step and body, which would
 # leak this loop's `Ffi` into `with_client`'s body).
-fn sql_loop(db: Option[Db]) : Unit / Actor[SqlMsg] + Ffi = {
+fn sql_loop(db: Option[Db]) : Unit / Actor[SqlMsg] + Ffi {
   let msg = Actor.receive()
   match sql_step(db, msg) {
     Continue(d) -> sql_loop(d)
-    Done        -> ()
+    Done -> ()
   }
 }
 
@@ -428,11 +428,8 @@ fn sql_loop(db: Option[Db]) : Unit / Actor[SqlMsg] + Ffi = {
 # fail before entering `body` can check by issuing a trivial
 # `exec(c, "SELECT 1")` first.
 #[unstable]
-pub fn with_client[R, e](
-  path: String,
-  body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e
-) : R / Spawn + Ffi + Actor[SqlMsg] + e = {
-  let db  = sqlite.open(path)
+pub fn with_client[R, e](path: String, body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e) : R / Spawn + Ffi + Actor[SqlMsg] + e {
+  let db = sqlite.open(path)
   let pid = spawn_actor(() => sql_loop(db))
   body(pid)
 }
@@ -443,32 +440,31 @@ pub fn with_client[R, e](
 # non-`Reply` message is a protocol violation — it means something
 # other than this cell sent to the caller's mailbox between the ask
 # and the receive. We surface it as `SqlErr` rather than guess.
-fn expect_reply(msg: SqlMsg) : SqlReply =
-  match msg {
-    Reply(payload)        -> payload
-    Exec(_, _, _)         -> SqlErr("protocol: stray Exec on reply mailbox")
-    QueryRow(_, _, _)     -> SqlErr("protocol: stray QueryRow on reply mailbox")
-    QueryRows(_, _, _)    -> SqlErr("protocol: stray QueryRows on reply mailbox")
-    QueryScalar(_, _, _)  -> SqlErr("protocol: stray QueryScalar on reply mailbox")
-    Shutdown              -> SqlErr("protocol: stray Shutdown on reply mailbox")
-  }
+fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
+  Reply(payload) -> payload
+  Exec(_, _, _) -> SqlErr("protocol: stray Exec on reply mailbox")
+  QueryRow(_, _, _) -> SqlErr("protocol: stray QueryRow on reply mailbox")
+  QueryRows(_, _, _) -> SqlErr("protocol: stray QueryRows on reply mailbox")
+  QueryScalar(_, _, _) -> SqlErr("protocol: stray QueryScalar on reply mailbox")
+  Shutdown -> SqlErr("protocol: stray Shutdown on reply mailbox")
+}
 
 # Run a no-row statement (DDL, INSERT, DELETE, UPDATE, BEGIN/COMMIT).
 # Returns `Ok(changes)` — the row count affected — on success, or
 # `Err(msg)` on a SQLite failure. Lives in `Actor[SqlMsg]` — no
 # `Ffi` at the call site.
 #[unstable]
-pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind])
-  : Result[String, Int] / Actor[SqlMsg] = {
-  let reply = cell.ask(c, (me) => Exec(sql, binds, me))
+pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, String] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => Exec(sql, binds, me))
   match expect_reply(reply) {
     ExecOk(changed) -> Ok(changed)
-    SqlErr(msg)     -> Err(msg)
+    SqlErr(msg) -> Err(msg)
+    RowFound(_) -> 
     # These payloads cannot answer an `Exec`; treat as a violation.
-    RowFound(_)     -> Err("protocol: RowFound reply to Exec")
-    RowAbsent       -> Err("protocol: RowAbsent reply to Exec")
-    RowsFound(_)    -> Err("protocol: RowsFound reply to Exec")
-    ScalarInt(_)    -> Err("protocol: ScalarInt reply to Exec")
+    Err("protocol: RowFound reply to Exec")
+    RowAbsent -> Err("protocol: RowAbsent reply to Exec")
+    RowsFound(_) -> Err("protocol: RowsFound reply to Exec")
+    ScalarInt(_) -> Err("protocol: ScalarInt reply to Exec")
   }
 }
 
@@ -477,16 +473,15 @@ pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind])
 # or `Err(msg)` on a SQLite failure. v1 reads a single TEXT column
 # (the `find`-by-key shape); the returned list has length 1 on a hit.
 #[unstable]
-pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind])
-  : Result[String, Option[[String]]] / Actor[SqlMsg] = {
-  let reply = cell.ask(c, (me) => QueryRow(sql, binds, me))
+pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[String]], String] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => QueryRow(sql, binds, me))
   match expect_reply(reply) {
     RowFound(cols) -> Ok(Some(cols))
-    RowAbsent      -> Ok(None)
-    SqlErr(msg)    -> Err(msg)
-    ExecOk(_)      -> Err("protocol: ExecOk reply to QueryRow")
-    RowsFound(_)   -> Err("protocol: RowsFound reply to QueryRow")
-    ScalarInt(_)   -> Err("protocol: ScalarInt reply to QueryRow")
+    RowAbsent -> Ok(None)
+    SqlErr(msg) -> Err(msg)
+    ExecOk(_) -> Err("protocol: ExecOk reply to QueryRow")
+    RowsFound(_) -> Err("protocol: RowsFound reply to QueryRow")
+    ScalarInt(_) -> Err("protocol: ScalarInt reply to QueryRow")
   }
 }
 
@@ -503,31 +498,29 @@ pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind])
 # A streaming / chunked protocol (or an ahu `Stream` source) for
 # unbounded scans is a follow-up — see `docs/design.md`.
 #[unstable]
-pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind])
-  : Result[String, [[String]]] / Actor[SqlMsg] = {
-  let reply = cell.ask(c, (me) => QueryRows(sql, binds, me))
+pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]], String] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => QueryRows(sql, binds, me))
   match expect_reply(reply) {
     RowsFound(rows) -> Ok(rows)
-    SqlErr(msg)     -> Err(msg)
-    ExecOk(_)       -> Err("protocol: ExecOk reply to QueryRows")
-    RowFound(_)     -> Err("protocol: RowFound reply to QueryRows")
-    RowAbsent       -> Err("protocol: RowAbsent reply to QueryRows")
-    ScalarInt(_)    -> Err("protocol: ScalarInt reply to QueryRows")
+    SqlErr(msg) -> Err(msg)
+    ExecOk(_) -> Err("protocol: ExecOk reply to QueryRows")
+    RowFound(_) -> Err("protocol: RowFound reply to QueryRows")
+    RowAbsent -> Err("protocol: RowAbsent reply to QueryRows")
+    ScalarInt(_) -> Err("protocol: ScalarInt reply to QueryRows")
   }
 }
 
 # Run a single-Int-column query (COUNT, MAX, scalar SELECT).
 # Returns `Ok(n)` or `Err(msg)`.
 #[unstable]
-pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind])
-  : Result[String, Int] / Actor[SqlMsg] = {
-  let reply = cell.ask(c, (me) => QueryScalar(sql, binds, me))
+pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, String] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => QueryScalar(sql, binds, me))
   match expect_reply(reply) {
     ScalarInt(n) -> Ok(n)
-    SqlErr(msg)  -> Err(msg)
-    ExecOk(_)    -> Err("protocol: ExecOk reply to QueryScalar")
-    RowFound(_)  -> Err("protocol: RowFound reply to QueryScalar")
-    RowAbsent    -> Err("protocol: RowAbsent reply to QueryScalar")
+    SqlErr(msg) -> Err(msg)
+    ExecOk(_) -> Err("protocol: ExecOk reply to QueryScalar")
+    RowFound(_) -> Err("protocol: RowFound reply to QueryScalar")
+    RowAbsent -> Err("protocol: RowAbsent reply to QueryScalar")
     RowsFound(_) -> Err("protocol: RowsFound reply to QueryScalar")
   }
 }
@@ -538,8 +531,7 @@ pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind])
 # body. After `close`, the client pid is dead; further helper calls
 # park forever on a reply that never comes.
 #[unstable]
-pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] =
-  Actor.send(c, Shutdown)
+pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] = Actor.send(c, Shutdown)
 
 # Run `body` inside a transaction scope. `BEGIN` on entry; `COMMIT`
 # if `body` returns `Ok`, `ROLLBACK` if it returns `Err`. The result
@@ -592,25 +584,21 @@ pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] =
 #     case; the cell's per-op statement isolation limits the blast
 #     radius.
 #[unstable]
-pub fn with_tx[R, e](
-  c: Pid[SqlMsg],
-  body: (Pid[SqlMsg]) -> Result[String, R] / Actor[SqlMsg] + e
-) : Result[String, R] / Actor[SqlMsg] + e =
-  match exec(c, "BEGIN", []) {
-    Err(msg) -> Err("BEGIN failed: " ++ msg)
-    Ok(_)    -> {
-      let result = body(c)
-      match result {
-        Ok(_)  -> match exec(c, "COMMIT", []) {
-          Ok(_)    -> result
-          Err(msg) -> Err("COMMIT failed: " ++ msg)
-        }
-        Err(_) -> {
-          # Roll back; the body's original Err is what propagates,
-          # so a rollback failure does not mask the real cause.
-          let _ = exec(c, "ROLLBACK", [])
-          result
-        }
+pub fn with_tx[R, e](c: Pid[SqlMsg], body: (Pid[SqlMsg]) -> Result[R, String] / Actor[SqlMsg] + e) : Result[R, String] / Actor[SqlMsg] + e = match exec(c, "BEGIN", []) {
+  Err(msg) -> Err("BEGIN failed: " ++ msg)
+  Ok(_) -> {
+    let result = body(c)
+    match result {
+      Ok(_) -> match exec(c, "COMMIT", []) {
+        Ok(_) -> result
+        Err(msg) -> Err("COMMIT failed: " ++ msg)
+      }
+      Err(_) -> {
+        # Roll back; the body's original Err is what propagates,
+        # so a rollback failure does not mask the real cause.
+        let _ = exec(c, "ROLLBACK", [])
+        result
       }
     }
   }
+}

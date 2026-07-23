@@ -20,52 +20,43 @@
 # liveness property that makes the cell safe to keep open.
 
 import actor
+
 import kohau.sqlite.client
 
-fn show_exec(label: String, r: Result[String, Int]) : Unit / Console =
-  match r {
-    Ok(changed) -> Stdout.print(label ++ ": ok changes=" ++ int_to_string(changed))
-    Err(_)      -> Stdout.print(label ++ ": err")
-  }
+fn show_exec(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(changed) -> Stdout.print(label ++ (": ok changes=" ++ int_to_string(changed)))
+  Err(_) -> Stdout.print(label ++ ": err")
+}
 
-fn show_scalar(label: String, r: Result[String, Int]) : Unit / Console =
-  match r {
-    Ok(n)  -> Stdout.print(label ++ ": " ++ int_to_string(n))
-    Err(_) -> Stdout.print(label ++ ": err")
-  }
+fn show_scalar(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(n) -> Stdout.print(label ++ (": " ++ int_to_string(n)))
+  Err(_) -> Stdout.print(label ++ ": err")
+}
 
-fn show_row(label: String, r: Result[String, Option[[String]]]) : Unit / Console =
-  match r {
-    Ok(_)  -> Stdout.print(label ++ ": ok")
-    Err(_) -> Stdout.print(label ++ ": err")
-  }
+fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+  Ok(_) -> Stdout.print(label ++ ": ok")
+  Err(_) -> Stdout.print(label ++ ": err")
+}
 
 # We print only "err" / "ok" (not the SQLite message text) so the
 # golden stays stable across libsqlite3 versions, whose error
 # strings differ in wording.
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console = {
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   # 1. malformed DDL
-  show_exec("bad ddl",
-    client.exec(c, "CREATE TABL oops (", []))
-
+  show_exec("bad ddl", client.exec(c, "CREATE TABL oops (", []))
   # 2. query against a table that does not exist
-  show_row("missing table",
-    client.query_row(c, "SELECT data FROM ghost WHERE id = ?", [BindText("x")]))
-
+  show_row("missing table", client.query_row(c, "SELECT data FROM ghost WHERE id = ?", [BindText("x")]))
   # 3. malformed scalar query
-  show_scalar("bad scalar",
-    client.query_scalar(c, "SELECT COUNT( FROM", []))
-
+  show_scalar("bad scalar", client.query_scalar(c, "SELECT COUNT( FROM", []))
   # 4. the cell survived: a valid statement now works
-  show_exec("recover ddl",
-    client.exec(c, "CREATE TABLE ok_table (id TEXT PRIMARY KEY, data TEXT NOT NULL)", []))
-  show_scalar("recover count",
-    client.query_scalar(c, "SELECT COUNT(*) FROM ok_table", []))
-
+  show_exec("recover ddl", client.exec(c, "CREATE TABLE ok_table (id TEXT PRIMARY KEY, data TEXT NOT NULL)", []))
+  show_scalar("recover count", client.query_scalar(c, "SELECT COUNT(*) FROM ok_table", []))
   client.close(c)
 }
 
-fn main() : Int / Spawn + Ffi + Console = {
-  with_mailbox { client.with_client(":memory:", body) }
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
   0
 }
