@@ -5,6 +5,34 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [0.4.0] — 2026-07-23
+
+### Changed
+
+- **The sources move to the orongo edition (kaikai 0.104).** kaikai
+  0.101 flipped `Result`'s type-argument order from
+  `Result[Error, Ok]` to `Result[Ok, Error]`, so every annotation in
+  the package stopped typing against the current compiler. The 18
+  affected annotations were rewritten with `kai migrate` and
+  `kai.toml` now declares `edition = "orongo"`.
+
+  `Ok` and `Err` are position-independent, so consumers that match by
+  constructor are unaffected. Consumers that *annotate* a kohau
+  result — `Result[String, Int]` for `exec`, and the same shape for
+  `query_scalar` and the client surface — must flip their own
+  annotations to `Result[Int, String]` and declare the orongo
+  edition.
+
+  The rewrite runs through the fmt-writer, so the sources also picked
+  up canonical 0.104 formatting. That is the bulk of the diff; the
+  semantic change is the argument order alone.
+
+- **`ahu` moves to v0.2.1** from v0.1.0. The release restarts
+  `Transient` bodies on a runtime fault, not only on an escalated
+  cancel, and installs effect handlers per fiber — both relevant to a
+  connection owned by a cell step function. kohau's own surface did
+  not change.
+
 ## [0.3.0] — 2026-07-03
 
 ### Changed
