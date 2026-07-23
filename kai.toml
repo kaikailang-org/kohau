@@ -11,7 +11,7 @@ edition = "orongo"
 # release into the user-level cache. This is the foundational
 # principle documented in README §*kohau builds on ahu* — the
 # ergonomic surface is a cell, not raw kaikai primitives.
-ahu = { source = "github.com/kaikailang-org/ahu", ref = "v0.1.0" }
+ahu = { source = "github.com/kaikailang-org/ahu", ref = "v0.2.1" }
 
 # kohau's own tier1 fixtures import kohau's #[unstable] decls
 # (sqlite.* low-level, client.* cell-wrapped) plus ahu's cell.*
