@@ -33,16 +33,31 @@
 
 KAI_BIN ?= kai
 
-# SQLite. Override via `make SQLITE_INC=... SQLITE_LIB=...` if the
-# installation is somewhere non-standard.
-SQLITE_INC := /opt/homebrew/opt/sqlite/include
-SQLITE_LIB := /opt/homebrew/opt/sqlite/lib
+# Library paths are discovered, not assumed, so the same Makefile
+# works on a Homebrew macOS box and a distro-packaged Linux one. Each
+# is `?=`, so an explicit `make PG_INC=... PG_LIB=...` still wins.
+#
+# macOS keeps both libraries keg-only under `/opt/homebrew/opt/`,
+# where the compiler does not look by default, so the paths must be
+# spelled out. On Linux they land in the default search path, and the
+# empty-string case below means "pass no -I/-L at all" rather than a
+# bogus directory.
 
-# PostgreSQL. Homebrew keeps libpq keg-only (it conflicts with a full
-# postgresql install), so the paths are explicit. Override via
-# `make PG_INC=... PG_LIB=...` elsewhere.
-PG_INC := /opt/homebrew/opt/libpq/include
-PG_LIB := /opt/homebrew/opt/libpq/lib
+# SQLite: pkg-config where available, Homebrew's keg otherwise.
+SQLITE_INC ?= $(shell pkg-config --variable=includedir sqlite3 2>/dev/null || echo /opt/homebrew/opt/sqlite/include)
+SQLITE_LIB ?= $(shell pkg-config --variable=libdir sqlite3 2>/dev/null || echo /opt/homebrew/opt/sqlite/lib)
+
+# PostgreSQL: `pg_config` ships with libpq itself and is the
+# authoritative answer on both platforms; Homebrew's keg is the
+# fallback for a macOS box where libpq is installed but not on PATH.
+PG_INC ?= $(shell pg_config --includedir 2>/dev/null || echo /opt/homebrew/opt/libpq/include)
+PG_LIB ?= $(shell pg_config --libdir 2>/dev/null || echo /opt/homebrew/opt/libpq/lib)
+
+# Expand to nothing when the corresponding path came back empty.
+SQLITE_INC_FLAG = $(if $(SQLITE_INC),-I$(SQLITE_INC))
+SQLITE_LIB_FLAG = $(if $(SQLITE_LIB),-L$(SQLITE_LIB))
+PG_INC_FLAG     = $(if $(PG_INC),-I$(PG_INC))
+PG_LIB_FLAG     = $(if $(PG_LIB),-L$(PG_LIB))
 
 # The shim ships inside this repo (unlike henua, which fetches it
 # from the kohau cache). `-include` brings the shim declarations
@@ -54,13 +69,13 @@ SHIM_H := c/sqlite_shim.h
 PG_SHIM_C := c/postgres_shim.c
 PG_SHIM_H := c/postgres_shim.h
 
-KAI_CFLAGS := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
-              -I$(SQLITE_INC) -include $(SHIM_H) $(SHIM_C) \
-              -L$(SQLITE_LIB) -lsqlite3
+KAI_CFLAGS = -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
+             $(SQLITE_INC_FLAG) -include $(SHIM_H) $(SHIM_C) \
+             $(SQLITE_LIB_FLAG) -lsqlite3
 
-PG_CFLAGS := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
-             -I$(PG_INC) -include $(PG_SHIM_H) $(PG_SHIM_C) \
-             -L$(PG_LIB) -lpq
+PG_CFLAGS = -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
+            $(PG_INC_FLAG) -include $(PG_SHIM_H) $(PG_SHIM_C) \
+            $(PG_LIB_FLAG) -lpq
 
 BUILD = build
 

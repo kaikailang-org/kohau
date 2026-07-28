@@ -29,8 +29,14 @@
 
 #include <libpq-fe.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Handles cross the boundary as int64_t. True on every platform
+// kohau targets; a port where it is not should fail here rather than
+// silently truncate a pointer.
+typedef char kai_pg_handle_fits[sizeof(PGconn *) <= sizeof(int64_t) ? 1 : -1];
 
 // ---- parameter accumulation ----
 
