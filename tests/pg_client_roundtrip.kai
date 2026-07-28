@@ -1,0 +1,110 @@
+# tests/pg_client_roundtrip.kai — the cell-wrapped client end to end.
+#
+# The property this fixture carries beyond `pg_roundtrip.kai`: `body`
+# runs in `Actor[PgMsg]` with **no `Ffi`** in its row. The cell owns
+# the connection and is the only code touching libpq — the same
+# confinement `kohau.sqlite.client` gives, which is what lets adapters
+# above kohau drop `/ Ffi` from their operations.
+#
+# Cases:
+#   1. exec reports the affected-row count parsed from cmd_tuples.
+#   2. query_row returns Some(cols) on a hit, None when absent.
+#   3. query_rows returns every row, in order, with the column count
+#      discovered from the result.
+#   4. Binds are parameters: an injection payload round-trips as data.
+#   5. A failed statement surfaces its SQLSTATE through the Result.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import actor
+
+import kohau.postgres.client
+
+fn run(c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] {
+  let _ = client.exec(c, sql, binds)
+  ()
+}
+
+fn show_exec(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.exec(c, sql, binds) {
+    Ok(n) -> Stdout.print(label ++ (": " ++ int_to_string(n)))
+    Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  }
+
+# Only the SQLSTATE prefix is asserted — the message text is
+# locale- and version-dependent and would make a brittle golden.
+fn show_err_state(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.exec(c, sql, binds) {
+    Ok(n) -> Stdout.print(label ++ (": ok " ++ int_to_string(n)))
+    Err(msg) -> Stdout.print(label ++ (": " ++ first_five(msg)))
+  }
+
+fn first_five(s: String) : String = string_slice(s, 0, 5)
+
+fn show_row(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.query_row(c, sql, binds) {
+    Ok(None) -> Stdout.print(label ++ ": absent")
+    Ok(Some(cols)) -> Stdout.print(label ++ (": [" ++ (join_pipe(cols) ++ "]")))
+    Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  }
+
+fn show_rows(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.query_rows(c, sql, binds) {
+    Ok(rows) -> Stdout.print(label ++ (": " ++ (int_to_string(count_rows(rows)) ++ render(rows))))
+    Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  }
+
+fn count_rows(rows: [[String]]) : Int = match rows {
+  [] -> 0
+  [_, ...rest] -> 1 + count_rows(rest)
+}
+
+fn render(rows: [[String]]) : String = match rows {
+  [] -> ""
+  [r, ...rest] -> (" [" ++ (join_pipe(r) ++ "]")) ++ render(rest)
+}
+
+fn join_pipe(cols: [String]) : String = match cols {
+  [] -> ""
+  [c] -> c
+  [c, ...rest] -> c ++ ("|" ++ join_pipe(rest))
+}
+
+# No `Ffi` in this row — the cell owns the connection. That is the
+# property under test.
+fn body(c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console {
+  show_exec("ddl", c, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)", [])
+  show_exec("insert", c, "INSERT INTO t (id, name) VALUES ($1, $2)",
+            [PgText("1"), PgText("alpha")])
+
+  run(c, "INSERT INTO t (id, name) VALUES ($1, $2)", [PgText("2"), PgText("beta")])
+  run(c, "INSERT INTO t (id, name) VALUES ($1, $2)", [PgText("3"), PgNull])
+
+  show_row("found", c, "SELECT name FROM t WHERE id = $1", [PgText("1")])
+  show_row("absent", c, "SELECT name FROM t WHERE id = $1", [PgText("99")])
+  show_rows("all", c, "SELECT id::text, name FROM t ORDER BY id", [])
+
+  # A bind is data, never syntax: the payload matches no row and the
+  # table it names survives.
+  show_rows("injection", c, "SELECT id::text FROM t WHERE name = $1",
+            [PgText("'; DROP TABLE t; --")])
+  show_rows("table_alive", c, "SELECT count(*)::text FROM t", [])
+
+  show_exec("update", c, "UPDATE t SET name = $1 WHERE id > $2",
+            [PgText("renamed"), PgText("1")])
+  show_exec("delete", c, "DELETE FROM t WHERE id = $1", [PgText("3")])
+
+  # 23505: unique violation, surfaced through the Result channel.
+  show_err_state("dup", c, "INSERT INTO t (id, name) VALUES ($1, $2)",
+                 [PgText("1"), PgText("clash")])
+
+  run(c, "DROP TABLE t", [])
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client("", body)
+  })
+  0
+}

@@ -1,0 +1,5 @@
+before: row
+restart: observed 08006
+after_query: row
+after_write: ok
+wrote_row: row
