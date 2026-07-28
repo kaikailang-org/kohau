@@ -1,0 +1,5 @@
+stored: 1:'; DROP TABLE t; --
+table_alive: 1:1
+tautology: 0
+quoting: 1:a'b"c\d
+literal_placeholder: 1:$1

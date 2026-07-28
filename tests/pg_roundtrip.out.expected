@@ -1,0 +1,8 @@
+ddl: command_ok
+insert: 1
+select: tuples_ok
+all: 3x3 [id,name,note] 1|alpha|first 2|beta|<null> 3|gamma|
+null_vs_empty: 2x1 [note] <null> 
+update: 2
+delete: 1
+final: 2x2 [id,name] 1|alpha 2|renamed

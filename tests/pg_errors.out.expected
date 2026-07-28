@@ -1,0 +1,9 @@
+bad_conn: dead
+bad_conn_msg: present
+syntax: 42601
+unique_violation: 23505
+undefined_table: 42P01
+bad_int: 22P02
+too_few_binds: 08P01
+too_many_binds: 08P01
+still_usable: ok
