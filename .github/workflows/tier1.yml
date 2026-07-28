@@ -12,6 +12,11 @@ name: tier1
 # kaikai ships publicly from the `kaikailang-org` Homebrew tap, so
 # `kai` is installed the same way a developer installs it — no token,
 # no private clone, no building the compiler from source.
+#
+# Two jobs: `tier1` covers the sqlite surface, which needs nothing but
+# a library, and `tier1-pg` covers postgres, which needs a live server
+# it provisions itself. They are separate so a postgres failure reads
+# as one, rather than turning the sqlite signal red.
 
 on:
   pull_request:
@@ -55,3 +60,72 @@ jobs:
 
       - name: kohau tier1 (run fixtures + diff outputs)
         run: make tier1
+
+  # The postgres fixtures need a live server, so they run as their own
+  # job: a failure here is a postgres failure, not a silent tier1 one.
+  #
+  # GitHub's `services:` containers are Linux-only and this runner is
+  # macOS (see the note at the top), so the server is provisioned the
+  # way a developer does it locally — initdb into a scratch directory,
+  # pg_ctl to start it. `libpq` and `postgresql@18` are both installed:
+  # postgresql@18 does ship libpq, but under `include/postgresql/` and
+  # `lib/postgresql/`, which are not the paths the Makefile defaults
+  # to; the standalone formula puts them where it expects.
+  tier1-pg:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      # A short socket directory: a Unix socket path is capped at ~103
+      # bytes and the runner's workspace path is long enough to blow
+      # that on its own.
+      PGHOST: /tmp/kohau-pg
+      PGUSER: postgres
+      PGDATABASE: kohau_test
+      PGDATA_DIR: /tmp/kohau-pgdata
+    steps:
+      - name: Check out kohau
+        uses: actions/checkout@v4
+
+      - name: Install kaikai (public Homebrew tap)
+        run: brew install kaikailang-org/kaikai/kaikai
+
+      - name: Install libpq and the postgres server
+        run: brew install libpq postgresql@18
+
+      - name: Toolchain versions
+        run: |
+          cc --version | head -1
+          kai --version
+          /opt/homebrew/opt/postgresql@18/bin/postgres --version
+
+      - name: Start a scratch postgres cluster
+        run: |
+          export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
+          mkdir -p "$PGHOST"
+          initdb -D "$PGDATA_DIR" -A trust -U postgres --locale=C -E UTF8
+          # -h '' keeps it off TCP entirely; it is reachable only
+          # through the socket directory above.
+          pg_ctl -D "$PGDATA_DIR" -o "-k $PGHOST -h ''" -l "$PGDATA_DIR/server.log" start
+          for i in $(seq 1 30); do
+            /opt/homebrew/opt/libpq/bin/psql -tAc 'SELECT 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          /opt/homebrew/opt/libpq/bin/createdb "$PGDATABASE"
+
+      - name: Resolve dependencies (ahu git-dep)
+        run: kai install
+
+      - name: kohau tier0-pg (compile the postgres module + fixtures)
+        run: make tier0-pg
+
+      - name: kohau tier1-pg (run fixtures + diff outputs)
+        run: make tier1-pg
+
+      - name: kohau tier1-pg-reconnect (restart the server mid-run)
+        run: |
+          export PATH="/opt/homebrew/opt/postgresql@18/bin:/opt/homebrew/opt/libpq/bin:$PATH"
+          make tier1-pg-reconnect
+
+      - name: Server log on failure
+        if: failure()
+        run: tail -50 "$PGDATA_DIR/server.log" || true
