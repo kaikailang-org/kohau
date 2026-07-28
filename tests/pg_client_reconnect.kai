@@ -1,0 +1,133 @@
+# tests/pg_client_reconnect.kai — the cell survives a dropped
+# connection.
+#
+# An external driver (`tests/pg-restart-driver.sh`) stops and starts
+# the server underneath this program, so the connection really drops
+# rather than being simulated. The trace stays deterministic because
+# the fixture polls for each transition instead of assuming a timing,
+# and prints only the *shape* of every outcome — never a message,
+# whose wording is libpq's and varies by platform and version.
+#
+# Cases:
+#   1. A statement before the drop succeeds.
+#   2. The drop is observed as `08006`: reconnected, but the write
+#      deliberately NOT replayed — a statement that failed on a dropped
+#      connection has an unknown outcome, so replaying it could
+#      duplicate work.
+#   3. Queries work again afterwards, on the reopened connection.
+#   4. So do writes, and the row one writes is really there — the
+#      reconnected connection is a working one, not just an open
+#      socket.
+#
+# Requires a server the driver is allowed to restart.
+
+import time
+
+import actor
+
+import kohau.postgres.client
+
+fn show_query(label: String, c: Pid[PgMsg], sql: String) : Unit / Actor[PgMsg] + Console =
+  match client.query_row(c, sql, []) {
+    Ok(Some(_)) -> Stdout.print(label ++ ": row")
+    Ok(None) -> Stdout.print(label ++ ": absent")
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+fn show_exec(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.exec(c, sql, binds) {
+    Ok(_) -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+# The leading SQLSTATE of an error string, or "-" when it carries
+# none. Keeps the golden free of libpq's message wording.
+fn code_of(msg: String) : String =
+  if string_length(msg) >= 5 and is_code(string_slice(msg, 0, 5)) { string_slice(msg, 0, 5) } else { "-" }
+
+fn is_code(s: String) : Bool = all_alnum(s, 0)
+
+fn all_alnum(s: String, i: Int) : Bool = if i >= string_length(s) {
+  true
+} else {
+  match char_at(s, i) {
+    None -> false
+    Some(ch) -> if (ch >= '0' and ch <= '9') or (ch >= 'A' and ch <= 'Z') {
+      all_alnum(s, i + 1)
+    } else {
+      false
+    }
+  }
+}
+
+fn body(c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console + Clock {
+  let _ = client.exec(c, "CREATE TABLE r (id INT PRIMARY KEY)", [])
+
+  # 1. Before the restart.
+  show_query("before", c, "SELECT 1")
+
+  # The driver restarts the server when it sees this table appear,
+  # then removes it — the next statements meet a dead connection.
+  let _ = client.exec(c, "CREATE TABLE restart_now (x INT)", [])
+  wait_for_restart(c, 0)
+  wait_for_server(c, 0)
+
+  # 2. The connection is live again: the probe above reconnected
+  #    (reporting 08006 rather than replaying its write).
+  show_query("after_query", c, "SELECT 1")
+
+  # 3. Writes work again on the reopened connection.
+  show_exec("after_write", c, "INSERT INTO r VALUES ($1)", [PgText("1")])
+
+  # 4. And the row it wrote is really there — the reconnected
+  #    connection is a working one, not just an open socket.
+  show_query("wrote_row", c, "SELECT id FROM r WHERE id = 1")
+
+  let _ = client.exec(c, "DROP TABLE r", [])
+  client.close(c)
+}
+
+# Poll until the drop becomes observable.
+#
+# The probe is a write, not a query: a query would be retried on the
+# fresh connection and come back `Ok`, hiding the very event this is
+# waiting for. A write reports `08006` — reconnected, but deliberately
+# not replayed — which is both the signal and the property under test.
+#
+# Bounded so a driver that never restarts fails the fixture loudly
+# rather than hanging.
+fn wait_for_restart(c: Pid[PgMsg], tries: Int) : Unit / Actor[PgMsg] + Console + Clock =
+  if tries >= 300 {
+    Stdout.print("restart: not observed")
+  } else {
+    match client.exec(c, "SELECT 1", []) {
+      Err(msg) -> Stdout.print("restart: observed " ++ code_of(msg))
+      Ok(_) -> {
+        sleep(millis(100))
+        wait_for_restart(c, tries + 1)
+      }
+    }
+  }
+
+# After the drop is observed the server may still be starting. Retry
+# until it answers, so the cases below test the reconnect rather than
+# the driver's timing.
+fn wait_for_server(c: Pid[PgMsg], tries: Int) : Unit / Actor[PgMsg] + Console + Clock =
+  if tries >= 300 {
+    Stdout.print("server: never came back")
+  } else {
+    match client.query_row(c, "SELECT 1", []) {
+      Ok(_) -> ()
+      Err(_) -> {
+        sleep(millis(100))
+        wait_for_server(c, tries + 1)
+      }
+    }
+  }
+
+fn main() : Int / Spawn + Ffi + Console + Clock {
+  with_mailbox(() => {
+    client.with_reconnecting_client("", body)
+  })
+  0
+}

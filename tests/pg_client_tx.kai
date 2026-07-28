@@ -1,0 +1,116 @@
+# tests/pg_client_tx.kai — transaction scope (`with_tx`) over the
+# cell-wrapped postgres client.
+#
+# `with_tx(c, body)` brackets the body in BEGIN / COMMIT-or-ROLLBACK:
+# COMMIT if the body returns `Ok`, ROLLBACK if it returns `Err`. All
+# in `Actor[PgMsg]` — no `Ffi`.
+#
+# Cases 1-3 mirror `client_tx.kai`'s (commit, explicit rollback,
+# mid-body failure). Case 4 is postgres-specific and the reason this
+# fixture exists rather than being a copy: **a failed statement
+# poisons the transaction**. Once any statement errors, PostgreSQL
+# rejects every subsequent one with SQLSTATE 25P02 until the
+# transaction ends. A body that swallows an inner `Err` and returns
+# `Ok` anyway therefore fails at COMMIT rather than committing
+# partial work — the opposite of SQLite, where the same body commits
+# whatever did succeed.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import actor
+
+import kohau.postgres.client
+
+fn count(c: Pid[PgMsg]) : Int / Actor[PgMsg] = match client.query_row(c, "SELECT count(*)::text FROM t", []) {
+  Ok(Some(cols)) -> first_int(cols)
+  Ok(None) -> -1
+  Err(_) -> -1
+}
+
+fn first_int(cols: [String]) : Int = match cols {
+  [] -> -1
+  [n, ..._] -> parse_int(n)
+}
+
+fn parse_int(s: String) : Int = parse_digits(s, 0, 0)
+
+fn parse_digits(s: String, i: Int, acc: Int) : Int = if i >= string_length(s) {
+  acc
+} else {
+  match char_at(s, i) {
+    None -> acc
+    Some(ch) -> if ch < '0' or ch > '9' {
+      acc
+    } else {
+      parse_digits(s, i + 1, acc * 10 + (char_to_int(ch) - char_to_int('0')))
+    }
+  }
+}
+
+fn show_tx(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(n) -> Stdout.print(label ++ (": Ok(" ++ (int_to_string(n) ++ ")")))
+  Err(_) -> Stdout.print(label ++ ": Err")
+}
+
+fn show_count(label: String, n: Int) : Unit / Console = Stdout.print(label ++ (": count=" ++ int_to_string(n)))
+
+fn body(c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console {
+  let _ = client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY, data TEXT NOT NULL)", [])
+
+  # ---- 1. commit path ----
+  # Body returns Ok — both rows persist.
+  let tx1 = client.with_tx(c, tx => match client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("a"), PgText("1")]) {
+    Err(m) -> Err(m)
+    Ok(_) -> client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("b"), PgText("2")])
+  })
+  show_tx("commit tx", tx1)
+  show_count("after commit", count(c))
+
+  # ---- 2. explicit rollback ----
+  # The insert succeeds but the body returns Err, so it is rolled
+  # back: count stays at 2.
+  let tx2 = client.with_tx(c, tx => {
+    let _ = client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("c"), PgText("3")])
+    Err("caller aborts the tx")
+  })
+  show_tx("rollback tx", tx2)
+  show_count("after rollback", count(c))
+
+  # ---- 3. mid-body failure ----
+  # First insert succeeds; the second violates the primary key. The
+  # body propagates that Err, so the whole tx rolls back — the good
+  # first insert does NOT persist.
+  let tx3 = client.with_tx(c, tx => match client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("d"), PgText("4")]) {
+    Err(m) -> Err(m)
+    Ok(_) -> client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("a"), PgText("dup")])
+  })
+  show_tx("mid-fail tx", tx3)
+  show_count("after mid-fail", count(c))
+
+  # ---- 4. a swallowed failure still cannot commit ----
+  # The body ignores the constraint violation and returns Ok. On
+  # SQLite the surviving insert would commit; on PostgreSQL the
+  # transaction is already aborted, so the COMMIT fails and nothing
+  # lands. `with_tx` surfaces that as Err rather than reporting a
+  # success that did not happen.
+  let tx4 = client.with_tx(c, tx => {
+    let _ = client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("e"), PgText("5")])
+    let _ = client.exec(tx, "INSERT INTO t VALUES ($1, $2)", [PgText("a"), PgText("dup")])
+    Ok(0)
+  })
+  show_tx("swallowed-fail tx", tx4)
+  show_count("after swallowed-fail", count(c))
+
+  # ---- 5. the connection survives every rollback above ----
+  show_count("final", count(c))
+
+  let _ = client.exec(c, "DROP TABLE t", [])
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client("", body)
+  })
+  0
+}

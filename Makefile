@@ -68,17 +68,27 @@ BUILD = build
 # server; everything else reaches libsqlite3 and runs anywhere. The
 # two sets link against different shims, so they are built by
 # separate rules and only the sqlite set rides the default tier0/tier1.
-PG_TEST_KAI   = $(wildcard tests/pg_*.kai)
+# The reconnect fixture restarts the server underneath itself, so it
+# cannot share a target with fixtures that assume a stable one — it
+# runs under `tier1-pg-reconnect` with a driver script instead.
+PG_RESTART_KAI  = tests/pg_client_reconnect.kai
+PG_RESTART_NAME = pg_client_reconnect
+PG_RESTART_BIN  = $(BUILD)/$(PG_RESTART_NAME)
+PG_RESTART_DRV  = tests/pg-restart-driver.sh
+
+PG_TEST_KAI   = $(filter-out $(PG_RESTART_KAI),$(wildcard tests/pg_*.kai))
 PG_TEST_NAMES = $(patsubst tests/%.kai,%,$(PG_TEST_KAI))
 PG_TEST_BINS  = $(addprefix $(BUILD)/,$(PG_TEST_NAMES))
 
-TEST_KAI   = $(filter-out $(PG_TEST_KAI),$(wildcard tests/*.kai))
+TEST_KAI   = $(filter-out $(PG_TEST_KAI) $(PG_RESTART_KAI),$(wildcard tests/*.kai))
 TEST_NAMES = $(patsubst tests/%.kai,%,$(TEST_KAI))
 TEST_BINS  = $(addprefix $(BUILD)/,$(TEST_NAMES))
 
-KOHAU_SRC = $(wildcard kohau/*.kai) $(wildcard kohau/sqlite/*.kai)
+KOHAU_SRC = $(wildcard kohau/*.kai) $(wildcard kohau/sqlite/*.kai) \
+            $(wildcard kohau/postgres/*.kai)
 
-.PHONY: tier0 tier1 tier1-fixtures tier0-pg tier1-pg tier1-pg-fixtures clean
+.PHONY: tier0 tier1 tier1-fixtures tier0-pg tier1-pg tier1-pg-fixtures \
+        tier1-pg-reconnect clean
 
 tier0: $(TEST_BINS)
 	@echo "tier0: kohau modules + $(words $(TEST_BINS)) fixtures compile."
@@ -127,6 +137,26 @@ tier1-pg-fixtures: $(PG_TEST_BINS)
 	  diff -u "$$exp" "$$out" || { echo "tier1-pg: $$n FAIL"; exit 1; }; \
 	  echo "tier1-pg: $$n OK"; \
 	done
+
+# Reconnect coverage. Separate from tier1-pg because it stops and
+# starts the server mid-run, which every other fixture assumes will
+# not happen. Needs the data directory as well as the connection
+# settings, since it drives pg_ctl:
+#
+#   make PGHOST=/tmp/kohau-pg PGDATABASE=kohau_test \
+#        PGDATA_DIR=/path/to/pgdata tier1-pg-reconnect
+#
+# The server is left running afterwards, as it was found.
+tier1-pg-reconnect: $(PG_RESTART_BIN)
+	@if [ -z "$(PGDATA_DIR)" ]; then \
+	  echo "tier1-pg-reconnect: set PGDATA_DIR to the server's data directory"; exit 1; \
+	fi
+	@set -e; \
+	exp="tests/$(PG_RESTART_NAME).out.expected"; \
+	out="$(BUILD)/$(PG_RESTART_NAME).out"; \
+	sh $(PG_RESTART_DRV) $(PG_RESTART_BIN) "$(PGDATA_DIR)" > "$$out"; \
+	diff -u "$$exp" "$$out" || { echo "tier1-pg-reconnect: FAIL"; exit 1; }; \
+	echo "tier1-pg-reconnect: $(PG_RESTART_NAME) OK"
 
 # Per-fixture build. `kai build` is the driver; the shim sources and
 # the library go through CFLAGS. Depends on kai.lock so a missing or

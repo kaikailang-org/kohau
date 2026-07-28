@@ -1,0 +1,599 @@
+# kohau/postgres/client.kai — cell-wrapped PostgreSQL client.
+#
+# Imported by user code as `import kohau.postgres.client`; types stay
+# bare (`PgMsg`, `PgBind`), functions are accessed dotted
+# (`client.with_client(conninfo, body)`, `client.exec(c, sql, binds)`).
+#
+# This is the **ergonomic surface** over `kohau.postgres`, and the
+# postgres counterpart of `kohau.sqlite.client`. It wraps a single
+# connection inside an ahu cell (a fiber + typed mailbox + recursive
+# step function), which buys the same three things:
+#
+#   1. **Ownership of the connection lifecycle.** The cell connects on
+#      spawn and calls `finish` on `Shutdown`. Callers never hold a
+#      `Conn`, never forget to close, never leak a `Res`.
+#   2. **Request/reply over a typed mailbox.** Callers send a
+#      high-level operation and receive a structured result. They
+#      never touch exec/clear.
+#   3. **Ffi confinement.** The cell-fiber is the only code that
+#      touches `Ffi`. Callers run in `Actor[PgMsg]`.
+#
+# The design rationale for the shape (`with_client(conninfo, body)`
+# rather than `connect : Pid`, a pid-free reply type, a high-level
+# protocol rather than a transliteration of the FFI) is identical to
+# `kohau.sqlite.client`'s — see that module's header. What follows is
+# only what differs for PostgreSQL.
+#
+# ## Values are always parameters
+#
+# `[PgBind]` values are bound to `$1..$n` placeholders and handed to
+# `PQexecParams` by the shim, so they reach the server out-of-band.
+# The cell never concatenates a value into SQL, and `kohau.postgres`
+# exposes no escaping helper that would let it. Identifiers (table and
+# column names) cannot be parameterised in any SQL dialect and remain
+# the caller's validation responsibility.
+#
+# Placeholders are `$1`-style and 1-indexed by list position — unlike
+# SQLite's `?`. A count mismatch is a server-side error, surfaced as
+# `PgErr` rather than silently truncated.
+#
+# ## Why no `QueryScalar`
+#
+# `kohau.sqlite.client` has one because SQLite's `column_int` reads a
+# typed Int off the row. libpq's text-format results give every value
+# back as a string, so a scalar query is `query_row` plus a caller-side
+# parse — a `QueryScalar` variant would only hide that parse, not
+# perform it. `query_row` covers the shape.
+#
+# ## Errors carry SQLSTATE
+#
+# `PgErr(sqlstate, message)` keeps the five-character SQLSTATE
+# separate from the message text. Branch on the code — it is stable
+# across server versions and locales; the message is neither. The
+# code is empty for failures that never reached the server (a dead
+# connection, an unallocatable result).
+#
+# ## v1 limitations
+#
+#   - **No statement cache.** Each operation is one `PQexecParams`
+#     round-trip. Server-side prepared statements (`PQprepare` /
+#     `PQexecPrepared`) are a v2 optimisation.
+#   - **Text-format binds only.** Every value is sent as a string and
+#     the server infers its type; a bind needing an explicit type
+#     takes a cast in the SQL (`$1::int`).
+#   - **Reconnection is opt-in and does not resume a session.**
+#     `with_reconnecting_client` reopens a dropped connection, but an
+#     open transaction does not survive it and writes are never
+#     replayed — see that function's header. `with_client` does not
+#     reconnect at all.
+#   - **No LISTEN/NOTIFY, COPY, or cursors.** The mailbox protocol
+#     would need an async reply shape for the first two and a
+#     streaming one for the third.
+#
+# ## Stability
+#
+# Every `pub` is `#[unstable]` for the Hanga Roa edition.
+
+import spawn
+
+import actor
+
+import ahu.cell
+
+import kohau.postgres
+
+# ---- protocol ----
+
+# A bound value, positional by list order — `$1` is the first element.
+# Named `PgBind` rather than `Bind` because `kohau.postgres` already
+# exports a `Bind` for the low-level surface; a consumer importing
+# both would otherwise have two `Bind` types in scope.
+#
+# `PgNull` binds SQL NULL, distinct from `PgText("")`.
+#[unstable]
+pub type PgBind
+  = PgText(String)
+  | PgNull
+
+# The reply payload. **Carries no `Pid`** — load-bearing for the same
+# reason as `kohau.sqlite.client`'s `SqlReply`: kaikai's region-brand
+# walker forbids returning a value whose type could embed a pid.
+#
+#   PgExecOk(affected)     — no-row statement succeeded; `affected`
+#                            is the parsed `cmd_tuples` count
+#   PgRowFound(cols)       — ≤1-row query hit; the row's columns
+#   PgRowAbsent            — ≤1-row query returned no rows
+#   PgRowsFound(rows)      — multi-row query, in result-set order
+#   PgErr(sqlstate, msg)   — any failure; sqlstate is "" when the
+#                            statement never reached the server
+#[unstable]
+pub type PgReply
+  = PgExecOk(Int)
+  | PgRowFound([String])
+  | PgRowAbsent
+  | PgRowsFound([[String]])
+  | PgErr(String, String)
+
+# The cell's mailbox message type. Mono-mailbox: the reply travels
+# back on the same mailbox as the request, wrapped in `PgReply_`.
+# Callers never construct or match these directly — the typed helpers
+# below do that.
+#[unstable]
+pub type PgMsg
+  = PgExec(String, [PgBind], Pid[PgMsg])
+  | PgCommit(Pid[PgMsg])
+  | PgQueryRow(String, [PgBind], Pid[PgMsg])
+  | PgQueryRows(String, [PgBind], Pid[PgMsg])
+  | PgShutdown
+  | PgReply_(PgReply)
+
+# ---- cell internals ----
+
+# Translate the client-level bind list into the low-level surface's.
+fn to_binds(bs: [PgBind]) : [Bind] = match bs {
+  [] -> []
+  [b, ...rest] -> {
+    let one = match b {
+      PgText(s) -> BindText(s)
+      PgNull -> BindNull
+    }
+    [one, ...to_binds(rest)]
+  }
+}
+
+# Read one row's columns, NULL rendered as the empty string. Callers
+# that must tell NULL from "" ask for the column via a SQL-side
+# `coalesce` or an `IS NULL` predicate — the mailbox reply is
+# `[String]`, which has no room for the distinction.
+fn read_cols(r: Res, row: Int, col: Int, nc: Int) : [String] / Ffi = if col >= nc {
+  []
+} else {
+  let v = postgres.get_value(r, row, col)
+  [v, ...read_cols(r, row, col + 1, nc)]
+}
+
+# Read every row of a materialised result. libpq has no cursor: the
+# whole set is already in the `Res`, so this is indexing, not stepping.
+fn read_rows(r: Res, row: Int, nr: Int, nc: Int) : [[String]] / Ffi = if row >= nr {
+  []
+} else {
+  let one = read_cols(r, row, 0, nc)
+  [one, ...read_rows(r, row + 1, nr, nc)]
+}
+
+# The typed failure for a result the server rejected.
+fn result_err(r: Res) : PgReply / Ffi =
+  PgErr(postgres.result_sqlstate(r), postgres.result_error_message(r))
+
+# Parse `cmd_tuples` ("3", or "" for statements that affect no rows)
+# into a count. Non-numeric input yields 0 rather than a failure: the
+# field is informational and a malformed one should not turn a
+# successful statement into an error.
+fn parse_count(s: String) : Int = parse_digits(s, 0, 0)
+
+fn parse_digits(s: String, i: Int, acc: Int) : Int =
+  if i >= string_length(s) {
+    acc
+  } else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> if c < '0' or c > '9' {
+        acc
+      } else {
+        parse_digits(s, i + 1, acc * 10 + (char_to_int(c) - char_to_int('0')))
+      }
+    }
+  }
+
+# Run a statement and hand the result to `k`, clearing it either way.
+# Every exec path funnels through here so no `Res` can leak: the
+# clear happens before the reply value escapes.
+fn with_result(c: Conn, sql: String, binds: [PgBind], k: (Res) -> PgReply / Ffi) : PgReply / Ffi =
+  match postgres.exec(c, sql, to_binds(binds)) {
+    None -> PgErr("", "exec failed: " ++ postgres.error_message(c))
+    Some(r) -> {
+      let reply = if postgres.result_ok(r) { k(r) } else { result_err(r) }
+      let _ = postgres.clear(r)
+      reply
+    }
+  }
+
+# Execute a no-row statement (DDL, INSERT, UPDATE, DELETE, BEGIN).
+#
+# A COMMIT gets one extra check. PostgreSQL accepts a commit on an
+# already-aborted transaction and answers PGRES_COMMAND_OK — but the
+# command tag reads "ROLLBACK", because that is what it actually did.
+# Reporting that as success would tell the caller their work landed
+# when it did not, so the downgrade is surfaced as a failure. The tag
+# is the only signal: the status, the SQLSTATE and the error message
+# all describe a clean success.
+fn run_exec(c: Conn, sql: String, binds: [PgBind], commit: Bool) : PgReply / Ffi =
+  with_result(c, sql, binds, r => if commit and postgres.cmd_status(r) == "ROLLBACK" {
+    PgErr("25P02", "transaction was aborted; commit rolled back instead")
+  } else {
+    PgExecOk(parse_count(postgres.cmd_tuples(r)))
+  })
+
+# Execute a ≤1-row query. More than one row is a caller error, not a
+# silent truncation: a query declared to return at most one row that
+# returns several means the predicate is wrong.
+fn run_query_row(c: Conn, sql: String, binds: [PgBind]) : PgReply / Ffi =
+  with_result(c, sql, binds, r => {
+    let nr = postgres.ntuples(r)
+    if nr == 0 {
+      PgRowAbsent
+    } else if nr == 1 {
+      PgRowFound(read_cols(r, 0, 0, postgres.nfields(r)))
+    } else {
+      PgErr("", "query_row: statement returned " ++ (int_to_string(nr) ++ " rows"))
+    }
+  })
+
+# Execute a multi-row query. The column count comes from the result,
+# so `SELECT *` and explicit column lists both work without the
+# caller declaring a width.
+fn run_query_rows(c: Conn, sql: String, binds: [PgBind]) : PgReply / Ffi =
+  with_result(c, sql, binds, r => PgRowsFound(read_rows(r, 0, postgres.ntuples(r), postgres.nfields(r))))
+
+# The cell's state: the connection (absent when connecting failed)
+# plus what is needed to rebuild it. `conninfo` is kept so a dropped
+# connection can be reopened without the caller re-supplying it;
+# `reconnect` is false for a client that opted out.
+type PgState = {
+  conn: Option[Conn],
+  conninfo: String,
+  reconnect: Bool
+}
+
+# Run `op` against the live connection, or reply the typed
+# connect-failure when the cell holds none.
+fn with_conn(c: Option[Conn], op: (Conn) -> PgReply / Ffi) : PgReply / Ffi = match c {
+  Some(conn) -> op(conn)
+  None -> PgErr("", "no connection: connect failed")
+}
+
+# Close the connection if the cell holds one.
+fn close_conn(c: Option[Conn]) : Int / Ffi = match c {
+  Some(conn) -> postgres.finish(conn)
+  None -> 0
+}
+
+# Whether a failure was the connection dropping rather than the
+# statement being rejected.
+#
+# `PQstatus` cannot answer this. libpq updates it lazily: the
+# statement that *discovers* the death fails while the status still
+# reads CONNECTION_OK, and only the following call reports
+# CONNECTION_BAD (verified against a server killed mid-session). A
+# reconnect keyed on the status therefore misses the very failure
+# that should trigger it.
+#
+# The SQLSTATE is what answers it. A statement the *server* rejected
+# always carries a five-character code (23505, 42601, ...), because
+# the server is what produced the error. A statement that died with
+# the connection has no code at all: there was no server left to
+# assign one. So an empty SQLSTATE on a failure means the failure was
+# ours, not the statement's.
+#
+# Measured on a server killed mid-session: the discovering statement
+# reports a failed result, an empty SQLSTATE, and a status still
+# reading CONNECTION_OK. Only the call after that returns no result
+# and flips the status. The empty code is the earliest available
+# signal, which is why it is the one used.
+fn lost_connection(r: PgReply) : Bool = match r {
+  PgErr(state, _) -> state == ""
+  PgExecOk(_) -> false
+  PgRowFound(_) -> false
+  PgRowAbsent -> false
+  PgRowsFound(_) -> false
+}
+
+# Reconnect after a dropped connection: discard the dead handle and
+# open a fresh one. `None` when the server is still unreachable — the
+# caller then replies the failure and keeps the state connectionless,
+# so the next request tries again.
+fn reopen(st: PgState) : PgState / Ffi {
+  let _ = close_conn(st.conn)
+  PgState { conn: live_conn(st.conninfo), conninfo: st.conninfo, reconnect: st.reconnect }
+}
+
+# Run one operation, reconnecting and retrying once if the connection
+# turned out to be dead.
+#
+# ## Why the retry is restricted to reads
+#
+# A statement that fails on a dropped connection has an unknown
+# outcome: the server may have applied it and died before the ack
+# reached us. Replaying an INSERT could duplicate it. So only
+# `retryable` operations — the queries, which have no effect on the
+# database — are re-run automatically. A write reports the failure and
+# leaves the decision to the caller, who knows whether the operation
+# is idempotent.
+#
+# A reconnect also destroys any open transaction: the new connection
+# has no BEGIN, so replaying a statement that belonged to a
+# transaction would run it outside one. Transaction-scoped work is
+# therefore never retried either — `with_tx` surfaces the failure and
+# the caller re-runs the whole scope.
+fn run_with_retry(st: PgState, retryable: Bool, op: (Conn) -> PgReply / Ffi) : (PgState, PgReply) / Ffi =
+  match st.conn {
+    None -> if st.reconnect {
+      # No connection: a previous attempt failed. Try to get one back.
+      let next = reopen(st)
+      match next.conn {
+        None -> (next, PgErr("", "no connection: connect failed"))
+        Some(conn) -> (next, op(conn))
+      }
+    } else {
+      (st, PgErr("", "no connection: connect failed"))
+    }
+    Some(conn) -> {
+      let reply = op(conn)
+      if st.reconnect and lost_connection(reply) {
+        let next = reopen(st)
+        match next.conn {
+          None -> (next, PgErr("08006", "connection lost; reconnect failed"))
+          Some(fresh) -> if retryable {
+            (next, op(fresh))
+          } else {
+            (next, PgErr("08006", "connection lost; reconnected, statement not retried"))
+          }
+        }
+      } else {
+        (st, reply)
+      }
+    }
+  }
+
+# The cell's step function. Each request runs to completion, replies,
+# and threads possibly-reconnected state forward.
+fn pg_step(st: PgState, msg: PgMsg) : StepResult[PgState] / Actor[PgMsg] + Ffi = match msg {
+  PgExec(sql, binds, reply_to) -> {
+    let (next, reply) = run_with_retry(st, false, conn => run_exec(conn, sql, binds, false))
+    Actor.send(reply_to, PgReply_(reply))
+    cell.keep(next)
+  }
+  PgCommit(reply_to) -> {
+    let (next, reply) = run_with_retry(st, false, conn => run_exec(conn, "COMMIT", [], true))
+    Actor.send(reply_to, PgReply_(reply))
+    cell.keep(next)
+  }
+  PgQueryRow(sql, binds, reply_to) -> {
+    let (next, reply) = run_with_retry(st, true, conn => run_query_row(conn, sql, binds))
+    Actor.send(reply_to, PgReply_(reply))
+    cell.keep(next)
+  }
+  PgQueryRows(sql, binds, reply_to) -> {
+    let (next, reply) = run_with_retry(st, true, conn => run_query_rows(conn, sql, binds))
+    Actor.send(reply_to, PgReply_(reply))
+    cell.keep(next)
+  }
+  PgShutdown -> {
+    let _ = close_conn(st.conn)
+    cell.cell_done()
+  }
+  PgReply_(_) ->
+  # A reply never arrives at the cell's own mailbox; if one does
+  # (a misrouted message), ignore it and keep running.
+  cell.keep(st)
+}
+
+fn pg_loop(st: PgState) : Unit / Actor[PgMsg] + Ffi {
+  let msg = Actor.receive()
+  match pg_step(st, msg) {
+    Continue(next) -> pg_loop(next)
+    Done -> ()
+  }
+}
+
+# ---- public surface ----
+
+# `postgres.connect` returns `Some(conn)` for an unusable connection
+# too (libpq keeps the error text on the object). The cell wants a
+# connection it can actually use, so a bad one is closed here and the
+# cell is spawned with `None` — every subsequent request then replies
+# the typed "no connection" error rather than failing per-statement.
+fn live_conn(conninfo: String) : Option[Conn] / Ffi = match postgres.connect(conninfo) {
+  None -> None
+  Some(c) -> if postgres.status(c) == CONNECTION_OK {
+    Some(c)
+  } else {
+    let _ = postgres.finish(c)
+    None
+  }
+}
+
+# Connect, run the connection inside a cell, and call `body` with the
+# client pid. `conninfo` is a libpq conninfo or URI string; the empty
+# string takes every setting from the environment (PGHOST, PGDATABASE,
+# PGUSER, ...).
+#
+# The effect rows are the load-bearing part of this signature:
+# `with_client` carries `Ffi` (it connects and spawns the FFI-touching
+# loop), `Spawn`, and `Actor[PgMsg]`; `body`'s row is
+# `Actor[PgMsg] + e` — **no `Ffi`**.
+#
+# On connect failure the cell spawns without a connection: every
+# helper replies `PgErr("", "no connection: connect failed")` and
+# `close` still shuts the cell down cleanly.
+#[unstable]
+pub fn with_client[R, e](conninfo: String, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e =
+  spawn_client(conninfo, false, body)
+
+# `with_client` plus reconnection: when a statement fails because the
+# connection dropped, the cell opens a fresh one and carries on. A
+# client that outlives a server restart wants this; a short-lived one
+# does not need it.
+#
+# ## What is and is not retried
+#
+# Queries (`query_row` / `query_rows`) are re-run on the new
+# connection — they have no effect on the database, so replaying one
+# is safe. Writes are **not**: a statement that failed on a dropped
+# connection has an unknown outcome (the server may have applied it
+# and died before acknowledging), so replaying an INSERT could
+# duplicate it. A write reports `08006` and leaves the retry decision
+# to the caller, who knows whether it is idempotent.
+#
+# ## Transactions do not survive
+#
+# A reconnect discards any open transaction — the new connection has
+# no BEGIN. Statements inside `with_tx` are never retried, and the
+# scope fails as a whole so the caller can re-run it. Reconnection
+# gives back a usable *connection*, not a resumed session.
+#
+# ## No backoff
+#
+# Each reconnect is a single immediate attempt. A cell facing a server
+# that stays down reconnects once per request and fails fast, rather
+# than parking the fiber. Rate-limiting a reconnect storm belongs to
+# the supervisor above (ahu's `with_restart_backoff`), not here.
+#[unstable]
+pub fn with_reconnecting_client[R, e](conninfo: String, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e =
+  spawn_client(conninfo, true, body)
+
+fn spawn_client[R, e](conninfo: String, reconnect: Bool, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e {
+  let st = PgState { conn: live_conn(conninfo), conninfo: conninfo, reconnect: reconnect }
+  let pid = spawn_actor(() => pg_loop(st))
+  body(pid)
+}
+
+# Peel the `PgReply_` wrapper off a mailbox message. A non-reply is a
+# protocol violation — something other than this cell sent to the
+# caller's mailbox between the ask and the receive.
+fn expect_reply(msg: PgMsg) : PgReply = match msg {
+  PgReply_(payload) -> payload
+  PgExec(_, _, _) -> PgErr("", "protocol: stray PgExec on reply mailbox")
+  PgCommit(_) -> PgErr("", "protocol: stray PgCommit on reply mailbox")
+  PgQueryRow(_, _, _) -> PgErr("", "protocol: stray PgQueryRow on reply mailbox")
+  PgQueryRows(_, _, _) -> PgErr("", "protocol: stray PgQueryRows on reply mailbox")
+  PgShutdown -> PgErr("", "protocol: stray PgShutdown on reply mailbox")
+}
+
+# Render a failure for the `Result` channel. The SQLSTATE is prefixed
+# when the server supplied one, so the string stays greppable without
+# callers having to destructure a pair.
+fn err_string(sqlstate: String, msg: String) : String =
+  if sqlstate == "" { msg } else { sqlstate ++ (": " ++ msg) }
+
+# Run a no-row statement (DDL, INSERT, UPDATE, DELETE, BEGIN/COMMIT).
+# Returns `Ok(affected)` — the row count the server reported — or
+# `Err(msg)`. Lives in `Actor[PgMsg]` — no `Ffi` at the call site.
+#[unstable]
+pub fn exec(c: Pid[PgMsg], sql: String, binds: [PgBind]) : Result[Int, String] / Actor[PgMsg] {
+  let reply = cell.ask(c, me => PgExec(sql, binds, me))
+  match expect_reply(reply) {
+    PgExecOk(n) -> Ok(n)
+    PgErr(state, msg) -> Err(err_string(state, msg))
+    PgRowFound(_) -> Err("protocol: PgRowFound reply to exec")
+    PgRowAbsent -> Err("protocol: PgRowAbsent reply to exec")
+    PgRowsFound(_) -> Err("protocol: PgRowsFound reply to exec")
+  }
+}
+
+# Commit the open transaction. Distinct from `exec(c, "COMMIT", [])`
+# because PostgreSQL answers a commit on an aborted transaction with
+# a *successful* result whose command tag reads "ROLLBACK": only this
+# path inspects the tag, so only this path can report the downgrade
+# as `Err` instead of a success that never happened. `with_tx` uses
+# it; call it directly if you drive BEGIN/COMMIT by hand.
+#[unstable]
+pub fn commit(c: Pid[PgMsg]) : Result[Int, String] / Actor[PgMsg] {
+  let reply = cell.ask(c, me => PgCommit(me))
+  match expect_reply(reply) {
+    PgExecOk(n) -> Ok(n)
+    PgErr(state, msg) -> Err(err_string(state, msg))
+    PgRowFound(_) -> Err("protocol: PgRowFound reply to commit")
+    PgRowAbsent -> Err("protocol: PgRowAbsent reply to commit")
+    PgRowsFound(_) -> Err("protocol: PgRowsFound reply to commit")
+  }
+}
+
+# Run a ≤1-row query. Returns `Ok(Some(cols))` on a hit, `Ok(None)`
+# when no row matched, or `Err(msg)`. A statement that returns more
+# than one row is an error, not a truncation.
+#[unstable]
+pub fn query_row(c: Pid[PgMsg], sql: String, binds: [PgBind]) : Result[Option[[String]], String] / Actor[PgMsg] {
+  let reply = cell.ask(c, me => PgQueryRow(sql, binds, me))
+  match expect_reply(reply) {
+    PgRowFound(cols) -> Ok(Some(cols))
+    PgRowAbsent -> Ok(None)
+    PgErr(state, msg) -> Err(err_string(state, msg))
+    PgExecOk(_) -> Err("protocol: PgExecOk reply to query_row")
+    PgRowsFound(_) -> Err("protocol: PgRowsFound reply to query_row")
+  }
+}
+
+# Run a multi-row query. Returns `Ok(rows)` — every result row's
+# columns in result-set order, possibly empty — or `Err(msg)`.
+#
+# The entire result set is materialised before replying: libpq itself
+# buffers it in the `PGresult`, so a streaming protocol here would not
+# make the query streaming — it would only chunk an already-complete
+# set. Genuine streaming needs the shim to grow a cursor or
+# single-row-mode surface first.
+#[unstable]
+pub fn query_rows(c: Pid[PgMsg], sql: String, binds: [PgBind]) : Result[[[String]], String] / Actor[PgMsg] {
+  let reply = cell.ask(c, me => PgQueryRows(sql, binds, me))
+  match expect_reply(reply) {
+    PgRowsFound(rows) -> Ok(rows)
+    PgErr(state, msg) -> Err(err_string(state, msg))
+    PgExecOk(_) -> Err("protocol: PgExecOk reply to query_rows")
+    PgRowFound(_) -> Err("protocol: PgRowFound reply to query_rows")
+    PgRowAbsent -> Err("protocol: PgRowAbsent reply to query_rows")
+  }
+}
+
+# Tell the cell to close its connection and exit. Fire-and-forget.
+# After `close`, the client pid is dead; further helper calls park
+# forever on a reply that never comes.
+#[unstable]
+pub fn close(c: Pid[PgMsg]) : Unit / Actor[PgMsg] = Actor.send(c, PgShutdown)
+
+# Run `body` inside a transaction scope. `BEGIN` on entry; `COMMIT`
+# if `body` returns `Ok`, `ROLLBACK` if it returns `Err`. The body's
+# result is threaded through — `with_tx` does not invent its own
+# success value.
+#
+# The rationale for a `Result`-returning body is the same as
+# `kohau.sqlite.client.with_tx`'s: kaikai has no exceptions, so the
+# failure channel is the returned value, and there is no hidden
+# control flow that rolls back behind the caller's back.
+#
+# ## PostgreSQL specifics
+#
+#   - **A failed statement aborts the transaction.** Unlike SQLite,
+#     once any statement inside a PostgreSQL transaction errors, the
+#     server rejects every subsequent one with SQLSTATE 25P02 until
+#     the transaction ends. A body that ignores an inner `Err` and
+#     returns `Ok` therefore commits nothing, and `with_tx` returns
+#     `Err` — the commit is answered with a *successful* result whose
+#     command tag reads "ROLLBACK", and `commit` catches that
+#     downgrade. Reporting `Ok` there would claim work landed when it
+#     did not.
+#   - **No nesting.** A nested `BEGIN` is a warning (25001) and joins
+#     the outer transaction rather than opening a new one, so an inner
+#     `ROLLBACK` would discard the outer one's work too. Savepoints
+#     are the follow-up if a fixture needs nesting.
+#   - **No isolation-level control.** v1 issues a plain `BEGIN` (READ
+#     COMMITTED by default). `BEGIN ISOLATION LEVEL ...` lands via a
+#     `with_tx_mode` variant when a consumer needs it.
+#   - **Rollback errors are swallowed**, so the body's original `Err`
+#     propagates rather than being masked.
+#[unstable]
+pub fn with_tx[R, e](c: Pid[PgMsg], body: (Pid[PgMsg]) -> Result[R, String] / Actor[PgMsg] + e) : Result[R, String] / Actor[PgMsg] + e = match exec(c, "BEGIN", []) {
+  Err(msg) -> Err("BEGIN failed: " ++ msg)
+  Ok(_) -> {
+    let result = body(c)
+    match result {
+      Ok(_) -> match commit(c) {
+        Ok(_) -> result
+        Err(msg) -> Err("COMMIT failed: " ++ msg)
+      }
+      Err(_) -> {
+        let _ = exec(c, "ROLLBACK", [])
+        result
+      }
+    }
+  }
+}
