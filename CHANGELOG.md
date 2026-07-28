@@ -91,11 +91,27 @@ project adheres to [Semantic Versioning](https://semver.org/) once
   against a connection that really dropped. Needs `PGDATA_DIR` as
   well as the connection settings, since it drives `pg_ctl`.
 
+### Changed
+
+- **The Makefile discovers library paths instead of assuming them.**
+  `SQLITE_INC` / `PG_INC` and their `_LIB` counterparts now come from
+  `pkg-config` and `pg_config`, falling back to Homebrew's kegs, and
+  are `?=` so an explicit override still wins. macOS keeps both
+  libraries keg-only where the compiler does not look, while Linux
+  puts them on the default search path; the empty case emits no
+  `-I`/`-L` rather than a bogus directory. Prerequisite for building
+  on a second platform.
+
 ### Fixed
 
 - **`kai.toml` declares `edition = "hanga-roa"`.** 0.4.0 declared
   `orongo`, which is not a released edition — hanga-roa is the
   current one.
+
+- **The postgres shim asserts its handle-width assumption.** Handles
+  cross the FFI boundary as `int64_t`; a platform where a pointer
+  does not fit now fails to compile rather than silently truncating
+  one.
 
 ## [0.4.0] — 2026-07-23
 

@@ -13,10 +13,13 @@ name: tier1
 # `kai` is installed the same way a developer installs it — no token,
 # no private clone, no building the compiler from source.
 #
-# Two jobs: `tier1` covers the sqlite surface, which needs nothing but
-# a library, and `tier1-pg` covers postgres, which needs a live server
+# Three jobs. `tier1` covers the sqlite surface, which needs nothing
+# but a library; `tier1-pg` covers postgres, which needs a live server
 # it provisions itself. They are separate so a postgres failure reads
 # as one, rather than turning the sqlite signal red.
+#
+# `tier1-pg-linux` is the second platform, and is non-blocking until
+# kaikai publishes a Linux binary — see the note above the job.
 
 on:
   pull_request:
@@ -129,3 +132,85 @@ jobs:
       - name: Server log on failure
         if: failure()
         run: tail -50 "$PGDATA_DIR/server.log" || true
+
+  # Linux coverage, non-blocking until kaikai ships a Linux binary.
+  #
+  # The toolchain is the only thing missing: as of v0.105.1 the
+  # release publishes `darwin-arm64` alone and the Homebrew formula
+  # carries just an `on_macos` block, so the install step below fails
+  # and `continue-on-error` keeps that from gating the merge queue.
+  # Everything after it is real and ready — the job stops being a
+  # placeholder the day a linux-x64 artefact exists, by deleting the
+  # `continue-on-error` line.
+  #
+  # Why it is worth carrying meanwhile: kohau's C shims are the part
+  # most likely to break on a second platform. `long` vs `int64_t`
+  # widths, header locations, and the default library search path all
+  # differ, and none of that is exercised by a macOS-only matrix.
+  #
+  # Unlike the macOS job this one uses a service container — they are
+  # Linux-only, which is exactly the platform here — so postgres is
+  # provisioned by the runner rather than by initdb. The consequence
+  # is that `tier1-pg-reconnect` is NOT run: it drives `pg_ctl`
+  # against the server's data directory, which lives inside the
+  # container and is not reachable from the job.
+  tier1-pg-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kohau_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Over TCP rather than a socket: the server is in a container,
+      # so there is no shared socket directory.
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: kohau_test
+    steps:
+      - name: Check out kohau
+        uses: actions/checkout@v4
+
+      - name: Install libpq and libsqlite3 headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
+
+      - name: Install kaikai
+        # No Linux artefact is published yet; this is the step that
+        # fails today and the one that will start working unchanged.
+        run: |
+          echo "kaikai publishes darwin-arm64 only as of v0.105.1."
+          echo "Replace this step with the Linux install once an"
+          echo "artefact exists; everything below already works."
+          exit 1
+
+      - name: Toolchain versions
+        run: |
+          cc --version | head -1
+          pg_config --version
+          kai --version
+
+      - name: Resolve dependencies (ahu git-dep)
+        run: kai install
+
+      - name: kohau tier1 (sqlite)
+        run: make tier1
+
+      - name: kohau tier1-pg (postgres)
+        # tier1-pg-reconnect is absent by design: it needs pg_ctl on
+        # the data directory, which lives inside the service container.
+        run: make tier1-pg
