@@ -5,6 +5,98 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [Unreleased]
+
+### Added
+
+- **`kohau.postgres` — low-level PostgreSQL client.** Mirrors
+  `kohau.sqlite`'s shape (typed `Conn` / `Res` handles,
+  `Option`-returning constructors) over libpq, bridged by
+  `c/postgres_shim.{c,h}`.
+
+  Values are **always** bound as parameters, never spliced into SQL.
+  The FFI cannot pass `PQexecParams`'s `paramValues` string array, so
+  the shim accumulates binds per connection and hands the vector to
+  `PQexecParams` at exec time. The module deliberately exposes no
+  escaping helper: offering one invites building statements by
+  concatenation, and the surface has no path that would need it.
+
+  Supported range: **libpq 12+ against server 12+**. The shim calls
+  only protocol-v3 entry points (stable since 7.4), but 12 is the
+  floor that is realistically testable.
+
+  Result diagnostics carry `result_sqlstate` — the five-character
+  SQLSTATE, stable across server versions and locales, unlike the
+  message text.
+
+- **`kohau.postgres.client` — cell-wrapped PostgreSQL client.** The
+  postgres counterpart of `kohau.sqlite.client`, and the ergonomic
+  surface: an ahu cell owns the connection, callers send high-level
+  operations (`exec` / `query_row` / `query_rows`) over a typed
+  mailbox and run in `Actor[PgMsg]` with **no `Ffi`** in their row.
+  `with_tx` brackets a body in BEGIN/COMMIT/ROLLBACK.
+
+  Differences from the SQLite client, all forced by the database
+  rather than chosen: no `query_scalar` (libpq returns every value as
+  text, so a scalar query is `query_row` plus a caller-side parse);
+  errors carry SQLSTATE separately from the message; a statement
+  returning more than one row fails `query_row` instead of
+  truncating; and a failed statement inside a transaction poisons it
+  until the transaction ends (25P02), so a body that swallows an
+  inner `Err` fails at COMMIT rather than committing partial work.
+
+  The bind type is `PgBind` (`PgText` / `PgNull`), not `Bind` —
+  `kohau.postgres` already exports a `Bind` for the low-level
+  surface, and a consumer importing both would otherwise have two in
+  scope.
+
+- **Opt-in reconnection: `client.with_reconnecting_client`.** When a
+  statement fails because the connection dropped, the cell opens a
+  fresh one and carries on. Queries are re-run on it; **writes are
+  not** — a statement that failed on a dropped connection has an
+  unknown outcome (the server may have applied it and died before
+  acknowledging), so replaying an INSERT could duplicate it. A write
+  reports `08006` and leaves the retry decision to the caller. An
+  open transaction does not survive a reconnect either, so
+  transaction-scoped work always fails as a whole.
+
+  Detection keys on the SQLSTATE being *empty*, not on `PQstatus`:
+  libpq updates the status lazily, so the statement that discovers
+  the death still reads `CONNECTION_OK` and only the following call
+  reports `CONNECTION_BAD` — a reconnect keyed on the status misses
+  the very failure that should trigger it. A server-rejected
+  statement always carries a five-character code; one that died with
+  the connection carries none.
+
+- **`client.commit`, and `postgres.cmd_status` /
+  `transaction_status`.** PostgreSQL answers a COMMIT on an aborted
+  transaction with a *successful* result whose command tag reads
+  `ROLLBACK`. `with_tx` reported that as `Ok`, claiming work had
+  landed when nothing had; it now routes commits through
+  `client.commit`, which inspects the tag and returns `Err`. The tag
+  is the only signal — status, SQLSTATE and message all describe a
+  clean success.
+
+- **`tier0-pg` / `tier1-pg` Makefile targets** covering five
+  fixtures: parameter binding (including that injection payloads
+  round-trip as inert data), the low-level surface end to end (NULL
+  vs empty string, `cmd_tuples`, column names), failure paths by
+  SQLSTATE, the cell-wrapped client, and transaction scoping. Kept
+  out of the default `tier1` because they need a running server;
+  point them at one via libpq's environment.
+
+- **`tier1-pg-reconnect`**, a sixth fixture on its own target: it
+  stops and starts the server mid-run through
+  `tests/pg-restart-driver.sh`, so the reconnect path is exercised
+  against a connection that really dropped. Needs `PGDATA_DIR` as
+  well as the connection settings, since it drives `pg_ctl`.
+
+### Fixed
+
+- **`kai.toml` declares `edition = "hanga-roa"`.** 0.4.0 declared
+  `orongo`, which is not a released edition — hanga-roa is the
+  current one.
+
 ## [0.4.0] — 2026-07-23
 
 ### Changed
