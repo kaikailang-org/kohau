@@ -1,0 +1,96 @@
+# tests/pg_errors.kai — failure paths carry a usable diagnosis.
+#
+# Cases:
+#   1. A connection to a nonexistent database yields a Conn object
+#      whose status is bad and whose error_message is non-empty —
+#      connect returning Some is not evidence of a live connection.
+#   2. A syntax error surfaces as a failed result with SQLSTATE 42601.
+#   3. A unique violation surfaces as 23505 — the branchable code,
+#      stable across server versions and locales, unlike the message.
+#   4. An undefined table surfaces as 42P01.
+#   5. A placeholder/bind count mismatch is a server-side error, not
+#      a silent truncation.
+#   6. A statement that fails leaves the connection usable.
+#
+# Only SQLSTATE codes are asserted, never message text: the messages
+# are locale- and version-dependent and would make a brittle golden.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import kohau.postgres
+
+fn run(c: Conn, sql: String, binds: [Bind]) : Unit / Ffi = match postgres.exec(c, sql, binds) {
+  None -> ()
+  Some(r) -> {
+    let _ = postgres.clear(r)
+    ()
+  }
+}
+
+# "ok" when the statement succeeded, otherwise its SQLSTATE.
+fn show_state(label: String, c: Conn, sql: String, binds: [Bind]) : Unit / Console + Ffi =
+  match postgres.exec(c, sql, binds) {
+    None -> Stdout.print(label ++ ": none")
+    Some(r) -> {
+      if postgres.result_ok(r) {
+        Stdout.print(label ++ ": ok")
+      } else {
+        Stdout.print(label ++ (": " ++ postgres.result_sqlstate(r)))
+      }
+      let _ = postgres.clear(r)
+      ()
+    }
+  }
+
+fn nonempty(s: String) : String = if s == "" { "empty" } else { "present" }
+
+fn bad_connection() : Unit / Console + Ffi =
+  match postgres.connect("dbname=kohau_no_such_database_exists") {
+    None -> Stdout.print("bad_conn: none")
+    Some(c) -> {
+      let live = postgres.status(c) == CONNECTION_OK
+      Stdout.print("bad_conn: " ++ (if live { "live" } else { "dead" }))
+      Stdout.print("bad_conn_msg: " ++ nonempty(postgres.error_message(c)))
+      let _ = postgres.finish(c)
+      ()
+    }
+  }
+
+fn body(c: Conn) : Unit / Console + Ffi {
+  run(c, "CREATE TABLE t (id INT PRIMARY KEY)", [])
+  run(c, "INSERT INTO t (id) VALUES ($1)", [BindText("1")])
+
+  show_state("syntax", c, "SELEKT 1", [])
+  show_state("unique_violation", c, "INSERT INTO t (id) VALUES ($1)", [BindText("1")])
+  show_state("undefined_table", c, "SELECT * FROM no_such_table", [])
+  show_state("bad_int", c, "INSERT INTO t (id) VALUES ($1)", [BindText("not-a-number")])
+
+  # More placeholders than binds: the server rejects it rather than
+  # running a statement with a missing value.
+  show_state("too_few_binds", c, "SELECT $1::text, $2::text", [BindText("only-one")])
+
+  # Unused binds are likewise rejected, not silently dropped.
+  show_state("too_many_binds", c, "SELECT $1::text",
+             [BindText("one"), BindText("two")])
+
+  # The connection survives every failure above.
+  show_state("still_usable", c, "SELECT id FROM t", [])
+
+  run(c, "DROP TABLE t", [])
+}
+
+fn main() : Unit / Console + Ffi {
+  bad_connection()
+  match postgres.connect("") {
+    None -> Stdout.print("connect: none")
+    Some(c) -> {
+      if postgres.status(c) == CONNECTION_OK {
+        body(c)
+      } else {
+        Stdout.print("connect: failed")
+      }
+      let _ = postgres.finish(c)
+      ()
+    }
+  }
+}

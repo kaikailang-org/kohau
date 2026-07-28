@@ -1,0 +1,117 @@
+# tests/pg_roundtrip.kai — the low-level surface end to end.
+#
+# Cases:
+#   1. DDL and INSERT report PGRES_COMMAND_OK with no result set.
+#   2. cmd_tuples counts affected rows for INSERT / UPDATE / DELETE.
+#   3. SELECT reports PGRES_TUPLES_OK; ntuples / nfields describe the
+#      shape, fname names the columns.
+#   4. NULL is distinguishable from the empty string — both read as
+#      "" through get_value, and only get_is_null tells them apart.
+#   5. Multi-row, multi-column access by (row, col) index.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import kohau.postgres
+
+fn run(c: Conn, sql: String, binds: [Bind]) : Unit / Ffi = match postgres.exec(c, sql, binds) {
+  None -> ()
+  Some(r) -> {
+    let _ = postgres.clear(r)
+    ()
+  }
+}
+
+fn show_status(label: String, c: Conn, sql: String, binds: [Bind]) : Unit / Console + Ffi =
+  match postgres.exec(c, sql, binds) {
+    None -> Stdout.print(label ++ ": none")
+    Some(r) -> {
+      let s = postgres.result_status(r)
+      let name = if s == PGRES_COMMAND_OK { "command_ok" }
+                 else if s == PGRES_TUPLES_OK { "tuples_ok" }
+                 else { "error" }
+      Stdout.print(label ++ (": " ++ name))
+      let _ = postgres.clear(r)
+      ()
+    }
+  }
+
+fn show_affected(label: String, c: Conn, sql: String, binds: [Bind]) : Unit / Console + Ffi =
+  match postgres.exec(c, sql, binds) {
+    None -> Stdout.print(label ++ ": none")
+    Some(r) -> {
+      Stdout.print(label ++ (": " ++ postgres.cmd_tuples(r)))
+      let _ = postgres.clear(r)
+      ()
+    }
+  }
+
+# "rows x cols [c0,c1] a|b b|c" — shape, column names, then the grid.
+fn show_grid(label: String, c: Conn, sql: String, binds: [Bind]) : Unit / Console + Ffi =
+  match postgres.exec(c, sql, binds) {
+    None -> Stdout.print(label ++ ": none")
+    Some(r) -> {
+      let nr = postgres.ntuples(r)
+      let nc = postgres.nfields(r)
+      let shape = int_to_string(nr) ++ ("x" ++ int_to_string(nc))
+      Stdout.print(label ++ (": " ++ (shape ++ (" [" ++ (names(r, 0, nc) ++ ("] " ++ grid(r, 0, nr, nc)))))))
+      let _ = postgres.clear(r)
+      ()
+    }
+  }
+
+fn names(r: Res, i: Int, nc: Int) : String / Ffi =
+  if i >= nc { "" }
+  else { (if i == 0 { "" } else { "," }) ++ (postgres.fname(r, i) ++ names(r, i + 1, nc)) }
+
+fn grid(r: Res, row: Int, nr: Int, nc: Int) : String / Ffi =
+  if row >= nr { "" }
+  else { (if row == 0 { "" } else { " " }) ++ (rowcells(r, row, 0, nc) ++ grid(r, row + 1, nr, nc)) }
+
+fn rowcells(r: Res, row: Int, col: Int, nc: Int) : String / Ffi =
+  if col >= nc { "" }
+  else { (if col == 0 { "" } else { "|" }) ++ (cell(r, row, col) ++ rowcells(r, row, col + 1, nc)) }
+
+# NULL renders as <null> so it is visible in the golden; libpq would
+# otherwise return "" for both a NULL and an empty string.
+fn cell(r: Res, row: Int, col: Int) : String / Ffi =
+  if postgres.get_is_null(r, row, col) { "<null>" } else { postgres.get_value(r, row, col) }
+
+fn body(c: Conn) : Unit / Console + Ffi {
+  show_status("ddl", c, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, note TEXT)", [])
+
+  show_affected("insert", c, "INSERT INTO t (id, name, note) VALUES ($1, $2, $3)",
+                [BindText("1"), BindText("alpha"), BindText("first")])
+
+  # A NULL bind and an empty-string bind, side by side.
+  run(c, "INSERT INTO t (id, name, note) VALUES ($1, $2, $3)",
+      [BindText("2"), BindText("beta"), BindNull])
+  run(c, "INSERT INTO t (id, name, note) VALUES ($1, $2, $3)",
+      [BindText("3"), BindText("gamma"), BindText("")])
+
+  show_status("select", c, "SELECT id FROM t", [])
+  show_grid("all", c, "SELECT id::text, name, note FROM t ORDER BY id", [])
+
+  # NULL vs empty string: only get_is_null separates them.
+  show_grid("null_vs_empty", c, "SELECT note FROM t WHERE id IN ($1, $2) ORDER BY id",
+            [BindText("2"), BindText("3")])
+
+  show_affected("update", c, "UPDATE t SET name = $1 WHERE id > $2",
+                [BindText("renamed"), BindText("1")])
+  show_affected("delete", c, "DELETE FROM t WHERE id = $1", [BindText("3")])
+  show_grid("final", c, "SELECT id::text, name FROM t ORDER BY id", [])
+
+  run(c, "DROP TABLE t", [])
+}
+
+fn main() : Unit / Console + Ffi = match postgres.connect("") {
+  None -> Stdout.print("connect: none")
+  Some(c) -> {
+    if postgres.status(c) == CONNECTION_OK {
+      body(c)
+    } else {
+      Stdout.print("connect: failed")
+    }
+    let _ = postgres.finish(c)
+    ()
+  }
+}

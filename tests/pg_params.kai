@@ -1,0 +1,87 @@
+# tests/pg_params.kai — parameters reach the server out-of-band.
+#
+# The property under test is the reason `kohau.postgres` exposes no
+# escaping helper: a bound value is never parsed as SQL, so the
+# classic injection payloads are stored and returned verbatim rather
+# than changing the statement's meaning.
+#
+# Cases:
+#   1. A bind carrying `'; DROP TABLE t; --` round-trips as data —
+#      and the table it names is still there afterwards.
+#   2. A bind carrying `' OR '1'='1` in a WHERE does NOT widen the
+#      match: zero rows, not every row.
+#   3. Quotes and backslashes survive a round-trip unmangled.
+#   4. A bind is never a placeholder: `$1` as a *value* stays text.
+#
+# Requires a server (see the Makefile's tier1-pg target); the
+# connection string arrives through PGHOST/PGDATABASE in the env.
+
+import kohau.postgres
+
+const INJECT : String = "'; DROP TABLE t; --"
+const TAUTOLOGY : String = "' OR '1'='1"
+
+fn run(c: Conn, sql: String, binds: [Bind]) : Unit / Ffi = match postgres.exec(c, sql, binds) {
+  None -> ()
+  Some(r) -> {
+    let _ = postgres.clear(r)
+    ()
+  }
+}
+
+# Render a single-column result set as "n:v1|v2", or "err" on failure.
+fn show(label: String, c: Conn, sql: String, binds: [Bind]) : Unit / Console + Ffi =
+  match postgres.exec(c, sql, binds) {
+    None -> Stdout.print(label ++ ": none")
+    Some(r) -> {
+      if postgres.result_ok(r) {
+        let n = postgres.ntuples(r)
+        Stdout.print(label ++ (": " ++ (int_to_string(n) ++ col0(r, 0, n))))
+      } else {
+        Stdout.print(label ++ ": err")
+      }
+      let _ = postgres.clear(r)
+      ()
+    }
+  }
+
+fn col0(r: Res, i: Int, n: Int) : String / Ffi =
+  if i >= n { "" }
+  else { (if i == 0 { ":" } else { "|" }) ++ (postgres.get_value(r, i, 0) ++ col0(r, i + 1, n)) }
+
+fn body(c: Conn) : Unit / Console + Ffi {
+  run(c, "CREATE TABLE t (id SERIAL PRIMARY KEY, data TEXT NOT NULL)", [])
+
+  # 1. The injection payload is stored as data, not executed.
+  run(c, "INSERT INTO t (data) VALUES ($1)", [BindText(INJECT)])
+  show("stored", c, "SELECT data FROM t WHERE id = $1", [BindText("1")])
+
+  # The table named in the payload still exists — the DROP never ran.
+  show("table_alive", c, "SELECT count(*)::text FROM t", [])
+
+  # 2. A tautology payload matches nothing: it is a value, not syntax.
+  show("tautology", c, "SELECT data FROM t WHERE data = $1", [BindText(TAUTOLOGY)])
+
+  # 3. Quotes and backslashes survive unmangled.
+  run(c, "INSERT INTO t (data) VALUES ($1)", [BindText("a'b\"c\\d")])
+  show("quoting", c, "SELECT data FROM t WHERE id = $1", [BindText("2")])
+
+  # 4. A bind is never re-scanned for placeholders.
+  run(c, "INSERT INTO t (data) VALUES ($1)", [BindText("$1")])
+  show("literal_placeholder", c, "SELECT data FROM t WHERE id = $1", [BindText("3")])
+
+  run(c, "DROP TABLE t", [])
+}
+
+fn main() : Unit / Console + Ffi = match postgres.connect("") {
+  None -> Stdout.print("connect: none")
+  Some(c) -> {
+    if postgres.status(c) == CONNECTION_OK {
+      body(c)
+    } else {
+      Stdout.print("connect: failed")
+    }
+    let _ = postgres.finish(c)
+    ()
+  }
+}

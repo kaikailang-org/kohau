@@ -1,0 +1,302 @@
+# kohau/postgres.kai — low-level PostgreSQL client for kaikai.
+# Imported by user code as `import kohau.postgres`; functions are
+# accessed dotted (`postgres.connect(conninfo)`,
+# `postgres.exec(c, sql)`), the handle types bare (`Conn`, `Res`).
+#
+# This module is the **low-level surface**. It mirrors libpq's native
+# API, bridged through a C shim that flattens the shapes kaikai's FFI
+# cannot express (the `paramValues` string array, out-parameters).
+#
+# ## Values are always parameters, never SQL text
+#
+# There is no way to splice a value into a statement through this
+# module. `exec` takes SQL with `$1..$n` placeholders and a list of
+# `Bind` values; the shim hands them to `PQexecParams`, so they reach
+# the server out-of-band and are never parsed as SQL. This is the one
+# non-negotiable property of the surface: no `escape` helper is
+# offered, because offering one invites building statements by
+# concatenation.
+#
+# ```kai
+# match postgres.connect("postgresql:///kohau") {
+#   None    -> ...  # connect failed
+#   Some(c) -> postgres.exec(c, "SELECT * FROM t WHERE id = $1",
+#                            [BindText("42")])
+# }
+# ```
+#
+# Placeholders are `$1`-style and 1-indexed by list position — unlike
+# SQLite's `?`. A count mismatch between placeholders and binds is a
+# server-side error, surfaced through `result_error_message`.
+#
+# ## Handles are typed
+#
+# The connection (`PGconn *`) and result (`PGresult *`) handles are
+# nominal types — `Conn` and `Res`. They cannot be confused with each
+# other or with plain integers, and the only producers are `connect`
+# and `exec`, which return `Option`: the failure case is a typed
+# absence, not a sentinel.
+#
+# Representation: each handle wraps the shim's pointer-as-`Int` in a
+# one-field record, for the same reason `kohau.sqlite` does — an
+# opaque extern type lowers to a private nominal type and cannot
+# appear in `pub` signatures (see docs/known-regressions.md).
+#
+# ## Result model
+#
+# libpq materialises the whole result set into one `Res`; there is no
+# cursor. Row and column access is by integer index, and every value
+# arrives as text. A `Res` that reports `PGRES_TUPLES_OK` carries
+# rows; `PGRES_COMMAND_OK` means success with no result set.
+#
+# ## Resource ownership
+#
+# Every `connect` must be matched by a `finish`, and every `Some(res)`
+# from `exec` by a `clear`. The low-level surface does NOT enforce
+# this. Direct callers are responsible.
+#
+# ## Supported PostgreSQL versions
+#
+# The shim calls only protocol-v3 libpq entry points, stable since
+# PostgreSQL 7.4. kohau targets **libpq 12+ against server 12+** —
+# the range that is realistically testable, not the theoretical floor.
+#
+# ## v1 limitations
+#
+# - Text-format binds only — every parameter is sent as a string and
+#   the server infers its type. A bind that needs an explicit type
+#   takes a cast in the SQL (`$1::int`).
+# - All values come back as text; numeric columns are parsed by the
+#   caller.
+# - At most 128 parameters per statement (the shim's ceiling).
+# - No async, COPY, LISTEN/NOTIFY, cursors, or server-side prepared
+#   statements.
+# - No connection pool — one connection per `connect` call.
+#
+# ## Stability
+#
+# Every `pub` is `#[unstable]` for the Hanga Roa edition.
+
+# Connection status: the connection is usable. Mirrors libpq's
+# CONNECTION_OK.
+pub const CONNECTION_OK : Int = 0
+
+# Result status: the statement succeeded and returned no result set
+# (INSERT/UPDATE/DELETE/DDL). Mirrors PGRES_COMMAND_OK.
+pub const PGRES_COMMAND_OK : Int = 1
+
+# Result status: the statement succeeded and rows are available.
+# Mirrors PGRES_TUPLES_OK.
+pub const PGRES_TUPLES_OK : Int = 2
+
+# Transaction state: no transaction block is open.
+pub const PQTRANS_IDLE : Int = 0
+
+# Transaction state: inside a transaction block.
+pub const PQTRANS_INTRANS : Int = 2
+
+# Transaction state: inside a FAILED transaction block. Every
+# statement is rejected with SQLSTATE 25P02 until the block ends, and
+# a COMMIT issued here silently downgrades to a rollback.
+pub const PQTRANS_INERROR : Int = 3
+
+# ---- handles ----
+
+# A live connection (`PGconn *`). Only `connect` produces one. The
+# `raw` field is the shim's pointer representation — internal to
+# kohau, not part of the stable surface.
+#[unstable]
+pub type Conn = { raw: Int }
+
+# A materialised result set (`PGresult *`). Only `exec` produces one.
+#[unstable]
+pub type Res = { raw: Int }
+
+# One bound value. `BindNull` binds SQL NULL, distinct from
+# `BindText("")` — libpq renders both as the empty string on the way
+# out, which is why `get_is_null` exists.
+#[unstable]
+pub type Bind = BindText(String) | BindNull
+
+# ---- lifecycle ----
+
+extern "C" fn kai_pg_connect(conninfo: String) : Int / Ffi
+
+extern "C" fn kai_pg_status(h: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_transaction_status(h: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_finish(h: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_error_message(h: Int) : String / Ffi
+
+# Open a connection from a libpq conninfo or URI string. Returns
+# `Some(conn)` when a connection object was allocated — which does NOT
+# mean the connection succeeded. Check `status` before using it: a
+# failed connection still carries the error text, reachable through
+# `error_message`, and must still be closed with `finish`.
+#[unstable]
+pub fn connect(conninfo: String) : Option[Conn] / Ffi {
+  let h = kai_pg_connect(conninfo)
+  if h == 0 {
+    None
+  } else {
+    Some(Conn { raw: h })
+  }
+}
+
+# Connection status. Returns `CONNECTION_OK` when the connection is
+# usable, non-zero otherwise.
+#[unstable]
+pub fn status(c: Conn) : Int / Ffi = kai_pg_status(c.raw)
+
+# Transaction state: `PQTRANS_IDLE`, `PQTRANS_INTRANS`, or
+# `PQTRANS_INERROR` for a failed block. Read this rather than
+# inferring the state from statement results — a COMMIT on a failed
+# block reports success while actually rolling back.
+#[unstable]
+pub fn transaction_status(c: Conn) : Int / Ffi = kai_pg_transaction_status(c.raw)
+
+# Close the connection, releasing any pending binds. Returns 0. Every
+# `connect` must be matched by one `finish`; the handle must not be
+# used after.
+#[unstable]
+pub fn finish(c: Conn) : Int / Ffi = kai_pg_finish(c.raw)
+
+# Human-readable error from the most recent failed operation on this
+# connection. Empty string when there is no error.
+#[unstable]
+pub fn error_message(c: Conn) : String / Ffi = kai_pg_error_message(c.raw)
+
+# ---- execution ----
+
+extern "C" fn kai_pg_params_reset(h: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_params_push_text(h: Int, value: String) : I32 / Ffi
+
+extern "C" fn kai_pg_params_push_null(h: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_exec_params(h: Int, sql: String) : Int / Ffi
+
+# Execute `sql`, binding `binds` to its `$1..$n` placeholders in list
+# order. Returns `Some(res)` on a result object — which does NOT mean
+# the statement succeeded; check `result_status`. Returns `None` when
+# the bind list exceeded the shim's ceiling or libpq could not
+# allocate a result. Every `Some(res)` must be matched by one `clear`.
+#
+# Values travel as parameters, so no escaping is needed or possible:
+# a bind can never be interpreted as SQL.
+#[unstable]
+pub fn exec(c: Conn, sql: String, binds: [Bind]) : Option[Res] / Ffi {
+  let _ = kai_pg_params_reset(c.raw)
+  let ok = push_binds(c, binds)
+  if ok {
+    let r = kai_pg_exec_params(c.raw, sql)
+    if r == 0 {
+      None
+    } else {
+      Some(Res { raw: r })
+    }
+  } else {
+    let _ = kai_pg_params_reset(c.raw)
+    None
+  }
+}
+
+fn push_binds(c: Conn, binds: [Bind]) : Bool / Ffi = match binds {
+  [] -> true
+  [b, ...rest] -> {
+    let rc = match b {
+      BindText(v) -> kai_pg_params_push_text(c.raw, v)
+      BindNull    -> kai_pg_params_push_null(c.raw)
+    }
+    if rc == 0 { push_binds(c, rest) } else { false }
+  }
+}
+
+# ---- result inspection ----
+
+extern "C" fn kai_pg_result_status(r: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_result_error_message(r: Int) : String / Ffi
+
+extern "C" fn kai_pg_result_sqlstate(r: Int) : String / Ffi
+
+extern "C" fn kai_pg_cmd_status(r: Int) : String / Ffi
+
+extern "C" fn kai_pg_cmd_tuples(r: Int) : String / Ffi
+
+extern "C" fn kai_pg_ntuples(r: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_nfields(r: Int) : I32 / Ffi
+
+extern "C" fn kai_pg_fname(r: Int, col: I32) : String / Ffi
+
+extern "C" fn kai_pg_get_value(r: Int, row: I32, col: I32) : String / Ffi
+
+extern "C" fn kai_pg_get_is_null(r: Int, row: I32, col: I32) : I32 / Ffi
+
+extern "C" fn kai_pg_clear(r: Int) : I32 / Ffi
+
+# Status of the executed statement: `PGRES_COMMAND_OK` (success, no
+# rows), `PGRES_TUPLES_OK` (success, rows available), or another value
+# for failure.
+#[unstable]
+pub fn result_status(r: Res) : Int / Ffi = kai_pg_result_status(r.raw)
+
+# True when the statement succeeded, under either success status.
+#[unstable]
+pub fn result_ok(r: Res) : Bool / Ffi {
+  let s = kai_pg_result_status(r.raw)
+  s == PGRES_COMMAND_OK or s == PGRES_TUPLES_OK
+}
+
+# Statement-level error message. Empty on success.
+#[unstable]
+pub fn result_error_message(r: Res) : String / Ffi = kai_pg_result_error_message(r.raw)
+
+# Five-character SQLSTATE for a failed statement (e.g. "23505" for a
+# unique violation). Stable across server versions and locales, unlike
+# the message text — branch on this, not on the message. Empty when
+# the statement succeeded.
+#[unstable]
+pub fn result_sqlstate(r: Res) : String / Ffi = kai_pg_result_sqlstate(r.raw)
+
+# The command tag the server actually executed ("INSERT 0 1",
+# "SELECT 3", "COMMIT", "ROLLBACK"). Load-bearing for COMMIT: a
+# commit on an aborted transaction succeeds at the protocol level but
+# reports "ROLLBACK", so the tag is the only way to tell a real
+# commit from a silently downgraded one.
+#[unstable]
+pub fn cmd_status(r: Res) : String / Ffi = kai_pg_cmd_status(r.raw)
+
+# Rows affected by an INSERT / UPDATE / DELETE, as libpq's decimal
+# string (e.g. "3"). Empty for statements that affect no rows.
+#[unstable]
+pub fn cmd_tuples(r: Res) : String / Ffi = kai_pg_cmd_tuples(r.raw)
+
+# Number of rows in the result set. 0 for a no-row statement.
+#[unstable]
+pub fn ntuples(r: Res) : Int / Ffi = kai_pg_ntuples(r.raw)
+
+# Number of columns in the result set. 0 for a no-row statement.
+#[unstable]
+pub fn nfields(r: Res) : Int / Ffi = kai_pg_nfields(r.raw)
+
+# Name of column `col` (0-indexed). Empty when out of range.
+#[unstable]
+pub fn fname(r: Res, col: Int) : String / Ffi = kai_pg_fname(r.raw, col)
+
+# Value at (`row`, `col`), both 0-indexed, as text. A SQL NULL reads
+# as the empty string — use `get_is_null` to tell them apart.
+#[unstable]
+pub fn get_value(r: Res, row: Int, col: Int) : String / Ffi = kai_pg_get_value(r.raw, row, col)
+
+# True when the value at (`row`, `col`) is SQL NULL.
+#[unstable]
+pub fn get_is_null(r: Res, row: Int, col: Int) : Bool / Ffi = kai_pg_get_is_null(r.raw, row, col) != 0
+
+# Free the result. Returns 0. Every `Some(res)` from `exec` must be
+# matched by one `clear`; the handle must not be used after.
+#[unstable]
+pub fn clear(r: Res) : Int / Ffi = kai_pg_clear(r.raw)

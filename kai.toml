@@ -21,5 +21,6 @@ ahu = { source = "github.com/kaikailang-org/ahu", ref = "v0.2.1" }
 [unstable]
 kohau = true
 sqlite = true
+postgres = true
 client = true
 cell = true
