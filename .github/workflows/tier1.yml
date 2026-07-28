@@ -189,14 +189,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
 
-      - name: Install kaikai
-        # No Linux artefact is published yet; this is the step that
-        # fails today and the one that will start working unchanged.
+      - name: Install kaikai (official installer)
+        # The install command from kaikai-lang.org/get-started, run
+        # verbatim — the same one a developer runs. It is not
+        # platform-specific; the artefact is. install.sh refuses any
+        # non-Darwin host outright ("Only macOS (darwin-arm64) is
+        # supported in this iteration"), so this is the step that
+        # fails today, and the one that starts passing untouched when
+        # a Linux build ships.
         run: |
-          echo "kaikai publishes darwin-arm64 only as of v0.105.1."
-          echo "Replace this step with the Linux install once an"
-          echo "artefact exists; everything below already works."
-          exit 1
+          curl -fsSL https://raw.githubusercontent.com/kaikailang-org/kaikai/main/install.sh | sh
+          echo "$HOME/.kaikai/bin" >> "$GITHUB_PATH"
 
       - name: Toolchain versions
         run: |
