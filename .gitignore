@@ -8,3 +8,4 @@ target/
 *.sqlite3
 .DS_Store
 build/
+**/.kai-cache/
