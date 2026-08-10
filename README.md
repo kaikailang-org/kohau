@@ -4,14 +4,14 @@ DB clients for [kaikai](https://github.com/kaikailang-org/kaikai). The
 persistence substrate that sits between the language's effects and
 the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 
-> **Status:** SQLite shipped in two layers — the low-level
-> surface (`kohau.sqlite`, typed FFI handles) and the cell-wrapped
-> ergonomic client (`kohau.sqlite.client`, an ahu cell that owns
-> the connection lifecycle and seals `Ffi` from callers). The
-> client gives request/reply query execution with the FFI
-> confined to one fiber. Connection pool, restart-on-failure, a
-> statement cache, and a multi-row query protocol are follow-ups.
-> Postgres is later.
+> **Status:** two drivers ship, each in two layers — a low-level
+> surface over typed FFI handles (`kohau.sqlite`, `kohau.postgres`)
+> and a cell-wrapped ergonomic client (`kohau.sqlite.client`,
+> `kohau.postgres.client`) whose ahu cell owns the connection
+> lifecycle and seals `Ffi` from callers. Both give request/reply
+> query execution with the FFI confined to one fiber. Postgres adds
+> opt-in reconnection. Connection pool, statement cache, and a
+> streaming multi-row protocol are follow-ups on both.
 
 ## What ships
 
@@ -82,26 +82,78 @@ inside the cell and never cross the mailbox. Spec:
 `docs/design.md`. End-to-end smoke: `tests/client_roundtrip.kai`
 and `tests/client_errors.kai`.
 
+**`kohau.postgres`** — low-level PostgreSQL client. Mirrors
+`kohau.sqlite`'s shape (typed `Conn` / `Res` handles,
+`Option`-returning constructors) over libpq, bridged by
+`c/postgres_shim.{c,h}`. Supported range: libpq 12+ against server
+12+.
+
+Values are **always** bound as parameters, never spliced into SQL.
+The FFI cannot pass `PQexecParams`'s `paramValues` string array, so
+the shim accumulates binds per connection and hands the vector over
+at exec time. The module deliberately exposes no escaping helper:
+offering one invites building statements by concatenation, and no
+path in the surface needs it.
+
+Result diagnostics carry `result_sqlstate` — the five-character
+SQLSTATE, stable across server versions and locales, unlike the
+message text.
+
+**`kohau.postgres.client`** — cell-wrapped PostgreSQL client. Same
+shape as the SQLite client: an ahu cell owns the connection,
+callers send `exec` / `query_row` / `query_rows` over a typed
+mailbox and run in `Actor[PgMsg]` with no `Ffi` in their row.
+`with_tx` brackets a body in BEGIN/COMMIT/ROLLBACK.
+
+Differences from the SQLite client, all forced by the database
+rather than chosen:
+
+- **No `query_scalar`** — libpq returns every value as text, so a
+  scalar query is `query_row` plus a caller-side parse.
+- **Errors carry SQLSTATE** separately from the message.
+- **`query_row` fails** on a statement returning more than one row
+  instead of truncating.
+- **A failed statement poisons its transaction** until it ends
+  (25P02), so a body that swallows an inner `Err` fails at COMMIT
+  rather than committing partial work.
+- **Binds are `PgBind`** (`PgText` / `PgNull`), not `Bind` — the
+  low-level surface already exports a `Bind`, and a consumer
+  importing both would otherwise have two in scope.
+
+**Opt-in reconnection** — `client.with_reconnecting_client`. When a
+statement fails because the connection dropped, the cell opens a
+fresh one and carries on. Queries are re-run on it; **writes are
+not**. A statement that failed on a dropped connection has an
+unknown outcome (the server may have applied it and died before
+acknowledging), so replaying an INSERT could duplicate it; a write
+reports `08006` and leaves the retry decision to the caller. An
+open transaction does not survive a reconnect either, so
+transaction-scoped work always fails as a whole.
+
 ## Building
 
-kohau's modules bind libsqlite3 through a C shim (`c/sqlite_shim.{c,h}`)
-and, since the cell-wrapped client, depend on the `ahu` package.
-`kai build` is the driver: it resolves the `ahu` dependency
-(`kai install` populates the cache and writes `kai.lock`), and the
-shim sources + `-lsqlite3` are passed through `CFLAGS`, which the
-`kai` wrapper forwards to its underlying `cc`. This mirrors henua's
-Makefile and the idiomatic `lnds/uira` raylib pattern — no raw
-`kaic2` invocation is needed.
+kohau's modules bind libsqlite3 and libpq through C shims
+(`c/sqlite_shim.{c,h}`, `c/postgres_shim.{c,h}`) and, since the
+cell-wrapped client, depend on the `ahu` package. `kai build` is the
+driver: it resolves the `ahu` dependency (`kai install` populates
+the cache and writes `kai.lock`), and the shim sources + link flags
+are passed through `CFLAGS`, which the `kai` wrapper forwards to its
+underlying `cc`. This mirrors henua's Makefile and the idiomatic
+`lnds/uira` raylib pattern — no raw `kaic2` invocation is needed.
 
 Requirements:
 
 - `kai` on `PATH`, version 0.91.0+ (git-dep resolution needs
   0.83.0+; the FFI v2 fixed-width boundary annotations the extern
-  declarations use need 0.91.0+). Verified against 0.98.0.
-- libsqlite3 headers + library. macOS Homebrew:
-  `/opt/homebrew/opt/sqlite/{include,lib}`. Override via
-  `make SQLITE_INC=... SQLITE_LIB=...` if the install lives
-  elsewhere.
+  declarations use need 0.91.0+). Verified against 0.111.0.
+- libsqlite3 headers + library.
+- libpq 12+ headers + library, for the Postgres targets only.
+
+Library paths are **discovered**, not assumed: `SQLITE_INC` /
+`PG_INC` and their `_LIB` counterparts come from `pkg-config` and
+`pg_config`, falling back to Homebrew's kegs. They are `?=`, so
+`make SQLITE_INC=... PG_LIB=...` still wins if an install lives
+somewhere else.
 
 Run the fixtures:
 
@@ -110,24 +162,35 @@ make tier0    # compile every fixture (runs kai install if needed)
 make tier1    # compile + run + diff against goldens
 ```
 
+The Postgres fixtures need a running server, so they sit on their
+own targets and stay out of the default `tier1`. Point them at a
+server through libpq's environment (`PGHOST`, `PGDATABASE`, …):
+
+```sh
+make tier0-pg            # compile the pg fixtures
+make tier1-pg            # compile + run + diff (5 fixtures)
+make tier1-pg-reconnect  # stops/starts the server mid-run; needs PGDATA_DIR
+```
+
 ## Foundational principle: kohau builds on ahu
 
 **kohau is built on top of [ahu](https://github.com/kaikailang-org/ahu),
 not on raw kaikai primitives.** Database connections, prepared
 statement caches, and connection pools are long-running stateful
 entities — exactly what ahu cells (Layer 2) and restart helpers
-(Layer 3) exist for. The raw FFI to libsqlite3 (or the wire-protocol
-machinery for Postgres) is the *low-level* surface; the *ergonomic*
-surface that downstream code uses is the cell-wrapped client, which
-gives request/reply query execution, supervised lifecycle, and pipe
-composition.
+(Layer 3) exist for. The raw FFI to libsqlite3 or libpq (and, later,
+the native wire-protocol machinery for Postgres) is the *low-level*
+surface; the *ergonomic* surface that downstream code uses is the
+cell-wrapped client, which gives request/reply query execution,
+supervised lifecycle, and pipe composition.
 
 Concretely: every backend driver exposes two shapes — a low-level
 function form (`open`, `execute`, `prepare`, `close` operating
 directly on the FFI/wire handle) and a cell-based wrapper form
 (`with_client(config, body)`) that runs the client inside an ahu
-cell with proper connection lifecycle, statement caching, and
-restart-on-failure semantics.
+cell with proper connection lifecycle and, as they land, statement
+caching and restart-on-failure semantics. Postgres has the first
+piece of the latter today in `with_reconnecting_client`.
 
 This is not optional. Implementations that bypass ahu — connection
 state stored in globals, raw `spawn` for background work, ad-hoc
@@ -160,59 +223,90 @@ The split keeps each layer focused:
 Mirrors Elixir Postgrex+Ecto, Go database/sql+gorm, Rust
 tokio-postgres+diesel.
 
-## v0.1 — SQLite first
+## v0.1 — SQLite first (shipped)
 
-The v0.1 goal is one driver that works end-to-end:
+The v0.1 goal was one driver working end-to-end — a kaikai program →
+kohau → libsqlite3 → file — so that henua's `SqliteRepository[A, I]`
+could be a thin adapter. That path is closed and covered by tier1.
 
-- **`SqliteClient`** — FFI to system `libsqlite3`. Bindings cover
-  `sqlite3_open` / `prepare_v2` / `step` / `column_*` / `bind_*` /
-  `finalize` / `close` / `errmsg`. ~30-50 FFI declarations.
-- Type codecs: INTEGER / REAL / TEXT / BLOB / NULL.
-- WAL mode default for concurrency.
-- Statement caching via fiber-local handle map.
-- Transactions (`BEGIN` / `COMMIT` / `ROLLBACK`) with deferred /
-  immediate / exclusive modes.
-- Result iteration via a streaming row interface.
-- Errors typed as `SqliteError` with the canonical libsqlite3 error
-  codes preserved.
+The driver shipped narrower than this section originally scoped it.
+Each cut below was taken deliberately, to reach a working end-to-end
+path sooner, and each is recorded at its site in
+`kohau/sqlite/client.kai`:
 
-This is enough to validate the full stack: a kaikai program → kohau
-→ libsqlite3 → file. From here, henua's `SqliteRepository[A, I]`
-becomes a thin adapter.
+- **Type codecs are `Int` and `String` only.** `Real` / `Blob` /
+  NULL need a `Bind` variant and a matching bind op on the low-level
+  surface; deferred until a consumer needs them.
+- **No statement cache.** Every operation prepares and finalizes its
+  own statement. An LRU keyed by SQL text is the intended shape.
+- **No streaming row interface.** `query_rows` replies with a
+  complete `[[String]]`, not a stream. A chunked protocol (or an ahu
+  `Stream` source) is the follow-up.
+- **Transactions are `deferred` only.** `BEGIN IMMEDIATE` /
+  `EXCLUSIVE` land via a `with_tx_mode` variant when a consumer
+  needs them.
+- **No WAL default.** Journal mode is left at libsqlite3's default.
+- **Errors are `String`, not a typed `SqliteError`.** The libsqlite3
+  status codes are preserved on the low-level surface (`0` /
+  `100` / `101`), but the client surface flattens failure to a
+  message.
 
-## Post-v0.1 — Postgres native
+Beyond the original scope, v0.1 also gained typed `Db` / `Stmt`
+handles (v0.3.0) and the cell-wrapped client that seals `Ffi` from
+callers.
 
-Native wire protocol in pure kaikai (Simple + Extended Query,
-SCRAM-SHA-256 auth, type codecs, connection pool basic). TLS via FFI
-to OpenSSL/LibreSSL. Decision pinned 2026-04-28: implementing the
-wire protocol natively is a language-credibility statement (mirrors
-Postgrex / pgx / tokio-postgres). Estimated 3-6 weeks of focused
-work, deferred until SQLite ships and henua's `SqliteRepository`
-validates the surface end-to-end.
+## Postgres — libpq today, native wire protocol still the goal
+
+**What ships now** is a client over **libpq via FFI** (see *What
+ships* above): the fastest route to a working Postgres path, and
+enough to validate the surface — parameter binding, SQLSTATE-typed
+failure, transaction scoping and reconnection are all exercised
+end-to-end against a real server.
+
+**The 2026-04-28 decision still stands**: the native wire protocol
+in pure kaikai (Simple + Extended Query, SCRAM-SHA-256 auth, type
+codecs, basic connection pool; TLS via FFI to OpenSSL/LibreSSL) is a
+language-credibility statement, mirroring Postgrex / pgx /
+tokio-postgres. Estimated 3-6 weeks of focused work. libpq is the
+intermediate step, not the replacement.
+
+Going through libpq first buys a stable reference: the cell-wrapped
+surface, the fixtures and the goldens are all backend-agnostic, so
+the native driver can be brought up behind the same API and
+differentially tested against the libpq one rather than against a
+specification alone.
 
 Eventually (post-Postgres): MySQL, ClickHouse, DuckDB.
 
-## Layout (target)
+## Layout
 
 ```
 kohau/
 ├── README.md
+├── CHANGELOG.md
 ├── kai.toml
+├── Makefile                    # tier0/tier1 targets, library discovery
 ├── docs/
-│   ├── design.md
-│   └── sqlite.md
+│   ├── design.md               # the cell-wrapped client protocol
+│   └── known-regressions.md    # upstream blockers the surface works around
 ├── kohau/                      # the importable kaikai modules
-│   ├── sqlite.kai              # SqliteClient + connection / query / tx
-│   ├── sqlite_ffi.kai          # FFI declarations against libsqlite3
-│   ├── sqlite_types.kai        # type codecs INTEGER / REAL / TEXT / BLOB / NULL
-│   ├── errors.kai              # SqliteError + shared error patterns
-│   └── client.kai              # DbClient protocol (shared shape for future drivers)
-├── examples/
-│   ├── hello_sqlite/           # open, create table, insert, select
-│   └── tx_demo/                # transactions BEGIN/COMMIT/ROLLBACK
-└── tests/
-    └── ...                     # tier1 fixtures
+│   ├── sqlite.kai              # low-level: handles, bind/step/column, tx
+│   ├── sqlite/client.kai       # cell-wrapped: exec / query_* / with_tx
+│   ├── postgres.kai            # low-level over libpq, SQLSTATE diagnostics
+│   └── postgres/client.kai     # cell-wrapped + opt-in reconnection
+├── c/                          # shims for shapes kaikai's FFI cannot express
+│   ├── sqlite_shim.{c,h}
+│   └── postgres_shim.{c,h}
+└── tests/                      # tier1 fixtures + goldens (.out.expected)
 ```
+
+Each driver keeps the same two-layer split: a `<driver>.kai` with
+the low-level FFI surface, and a `<driver>/client.kai` with the
+cell-wrapped one. There is no shared `DbClient` protocol type yet —
+the two clients converged on the same *shape* by construction, but
+the differences libpq forces (see above) mean a common signature
+would have to paper over them. It gets extracted when a third driver
+shows which parts are genuinely common.
 
 ## License
 
