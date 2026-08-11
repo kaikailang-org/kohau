@@ -1,0 +1,160 @@
+# tests/sqlite_types.kai — the storage classes beyond Int and Text.
+#
+# Covers the low-level surface added for REAL / BLOB / NULL:
+#
+#   1. bind_real / column_real round-trip
+#   2. bind_null, and column_type telling NULL apart from '' and 0
+#   3. bind_blob_hex / column_blob_hex round-trip, including bytes
+#      that would truncate a NUL-terminated string
+#   4. bind_blob_hex rejecting malformed hex
+#   5. clear_bindings dropping a value a reused statement would keep
+#   6. errcode / extended_errcode on a constraint violation
+#
+# Reals are compared as values, never rendered, so the goldens do not
+# depend on float formatting.
+
+import kohau.sqlite
+
+fn check_ok(label: String, ok: Bool) : Unit / Stdout = if ok {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ ": FAIL")
+}
+
+fn check_eq_int(label: String, got: Int, want: Int) : Unit / Stdout = if got == want {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ (": FAIL got=" ++ (int_to_string(got) ++ (" want=" ++ int_to_string(want)))))
+}
+
+fn check_eq_str(label: String, got: String, want: String) : Unit / Stdout = if got == want {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ (": FAIL got='" ++ (got ++ ("' want='" ++ (want ++ "'")))))
+}
+
+# ---- REAL ----
+
+# Bind a Real, read it back, and confirm the value survives intact.
+fn check_real(db: Db, value: Real) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?") {
+  None -> check_ok("real round-trip", false)
+  Some(stmt) -> {
+    let _ = sqlite.bind_real(stmt, 1, value)
+    let _ = sqlite.step(stmt)
+    let got = sqlite.column_real(stmt, 0)
+    check_ok("real round-trip", got == value)
+    check_eq_int("real column_type", sqlite.column_type(stmt, 0), 2)
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# ---- NULL ----
+
+# A bound NULL must report storage class NULL — not TEXT with an
+# empty string, which is what the coercing readers would suggest.
+fn check_null(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?, ?, ?") {
+  None -> check_ok("null binds", false)
+  Some(stmt) -> {
+    let _ = sqlite.bind_null(stmt, 1)
+    let _ = sqlite.bind_text(stmt, 2, "")
+    let _ = sqlite.bind_int(stmt, 3, 0)
+    let _ = sqlite.step(stmt)
+    check_eq_int("null is SQLITE_NULL", sqlite.column_type(stmt, 0), 5)
+    check_eq_int("'' is SQLITE_TEXT", sqlite.column_type(stmt, 1), 3)
+    check_eq_int("0 is SQLITE_INTEGER", sqlite.column_type(stmt, 2), 1)
+    # The readers coerce NULL to the zero value of whatever they
+    # read; only column_type distinguishes it.
+    check_eq_str("null reads as ''", sqlite.column_text(stmt, 0), "")
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# ---- BLOB ----
+
+# `hex` covers a NUL byte and a high byte: raw, this value would
+# truncate at the first byte if it crossed as a C string.
+fn check_blob(db: Db, hex: String) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?") {
+  None -> check_ok("blob round-trip", false)
+  Some(stmt) -> {
+    let rc = sqlite.bind_blob_hex(stmt, 1, hex)
+    check_eq_int("blob bind rc", rc, 0)
+    let _ = sqlite.step(stmt)
+    check_eq_str("blob round-trip", sqlite.column_blob_hex(stmt, 0), hex)
+    check_eq_int("blob column_type", sqlite.column_type(stmt, 0), 4)
+    check_eq_int("blob byte length", sqlite.column_bytes(stmt, 0), 4)
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# Malformed hex is a caller bug, reported as SQLITE_MISUSE (21)
+# rather than stored as a corrupt value.
+fn check_bad_hex(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?") {
+  None -> check_ok("bad hex rejected", false)
+  Some(stmt) -> {
+    check_eq_int("odd-length hex", sqlite.bind_blob_hex(stmt, 1, "abc"), 21)
+    check_eq_int("non-hex digit", sqlite.bind_blob_hex(stmt, 1, "zz"), 21)
+    check_eq_int("empty blob binds", sqlite.bind_blob_hex(stmt, 1, ""), 0)
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# ---- clear_bindings ----
+
+# `reset` rewinds execution but keeps bindings. A statement reused
+# for a call that binds fewer parameters would silently carry the
+# stale value over; clear_bindings is what prevents it.
+fn check_clear_bindings(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?") {
+  None -> check_ok("clear_bindings", false)
+  Some(stmt) -> {
+    let _ = sqlite.bind_text(stmt, 1, "sticky")
+    let _ = sqlite.step(stmt)
+    check_eq_str("bound value", sqlite.column_text(stmt, 0), "sticky")
+    # reset alone: the binding survives.
+    let _ = sqlite.reset(stmt)
+    let _ = sqlite.step(stmt)
+    check_eq_str("survives reset", sqlite.column_text(stmt, 0), "sticky")
+    # reset + clear_bindings: the parameter is NULL again.
+    let _ = sqlite.reset(stmt)
+    let _ = sqlite.clear_bindings(stmt)
+    let _ = sqlite.step(stmt)
+    check_eq_int("cleared to NULL", sqlite.column_type(stmt, 0), 5)
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# ---- error codes ----
+
+# A UNIQUE violation: the primary code is SQLITE_CONSTRAINT (19), and
+# the extended code refines it to SQLITE_CONSTRAINT_PRIMARYKEY
+# (1555) — which constraint broke is the branchable fact.
+fn check_errcodes(db: Db) : Unit / Ffi + Stdout {
+  let _ = sqlite.exec(db, "CREATE TABLE uniq (id INTEGER PRIMARY KEY)")
+  let _ = sqlite.exec(db, "INSERT INTO uniq (id) VALUES (1)")
+  let rc = sqlite.exec(db, "INSERT INTO uniq (id) VALUES (1)")
+  check_eq_int("constraint rc", rc, 19)
+  check_eq_int("errcode", sqlite.errcode(db), 19)
+  check_eq_int("extended errcode", sqlite.extended_errcode(db), 1555)
+}
+
+fn run_with_db(db: Db) : Int / Console + Ffi {
+  check_real(db, 3.5)
+  check_null(db)
+  # 00 is the byte that would truncate a C string; ff is high-bit.
+  check_blob(db, "00ff107a")
+  check_bad_hex(db)
+  check_clear_bindings(db)
+  check_errcodes(db)
+  check_eq_int("close", sqlite.close(db), 0)
+  0
+}
+
+fn main() : Int / Console + Ffi = match sqlite.open(":memory:") {
+  None -> {
+    check_ok("open", false)
+    1
+  }
+  Some(db) -> {
+    check_ok("open", true)
+    run_with_db(db)
+  }
+}

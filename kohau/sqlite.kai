@@ -56,9 +56,9 @@
 #   `"COMMIT"` / `"ROLLBACK"` directly (or use
 #   `client.with_tx` on the cell-wrapped surface).
 # - No bulk binding — bind parameters one at a time via
-#   `bind_text` / `bind_int`.
-# - Only `Int` and `String` column types — `Real`, `Blob`, `NULL`
-#   handling lands when consumers need it.
+#   `bind_text` / `bind_int` / `bind_real` / `bind_blob_hex` /
+#   `bind_null`.
+# - BLOBs cross this boundary hex-encoded; see `bind_blob_hex`.
 # - No connection pool — single connection per `open` call.
 # - Single-statement `exec` only when the statement takes no
 #   parameters; otherwise use the prepare/step flow.
@@ -79,6 +79,23 @@ pub const SQLITE_ROW : Int = 100
 
 # Step result: no more rows; finalize the statement.
 pub const SQLITE_DONE : Int = 101
+
+# ---- storage classes, as returned by `column_type` ----
+
+# 64-bit signed integer.
+pub const SQLITE_INTEGER : Int = 1
+
+# IEEE 754 double.
+pub const SQLITE_FLOAT : Int = 2
+
+# UTF-8 text.
+pub const SQLITE_TEXT : Int = 3
+
+# Uninterpreted bytes.
+pub const SQLITE_BLOB : Int = 4
+
+# SQL NULL — the absent value, distinct from `0` and `""`.
+pub const SQLITE_NULL : Int = 5
 
 # ---- handles ----
 
@@ -136,11 +153,27 @@ extern "C" fn kai_sqlite_bind_text(stmt: Int, idx: I32, value: String) : I32 / F
 
 extern "C" fn kai_sqlite_bind_int(stmt: Int, idx: I32, value: Int) : I32 / Ffi
 
+extern "C" fn kai_sqlite_bind_double(stmt: Int, idx: I32, value: Real) : I32 / Ffi
+
+extern "C" fn kai_sqlite_bind_null(stmt: Int, idx: I32) : I32 / Ffi
+
+extern "C" fn kai_sqlite_bind_blob_hex(stmt: Int, idx: I32, hex: String) : I32 / Ffi
+
+extern "C" fn kai_sqlite_clear_bindings(stmt: Int) : I32 / Ffi
+
 extern "C" fn kai_sqlite_step(stmt: Int) : I32 / Ffi
 
 extern "C" fn kai_sqlite_column_int(stmt: Int, col: I32) : Int / Ffi
 
 extern "C" fn kai_sqlite_column_text(stmt: Int, col: I32) : String / Ffi
+
+extern "C" fn kai_sqlite_column_double(stmt: Int, col: I32) : Real / Ffi
+
+extern "C" fn kai_sqlite_column_blob_hex(stmt: Int, col: I32) : String / Ffi
+
+extern "C" fn kai_sqlite_column_type(stmt: Int, col: I32) : I32 / Ffi
+
+extern "C" fn kai_sqlite_column_bytes(stmt: Int, col: I32) : I32 / Ffi
 
 extern "C" fn kai_sqlite_column_count(stmt: Int) : I32 / Ffi
 
@@ -173,6 +206,37 @@ pub fn bind_text(stmt: Stmt, idx: Int, value: String) : Int / Ffi = kai_sqlite_b
 #[unstable]
 pub fn bind_int(stmt: Stmt, idx: Int, value: Int) : Int / Ffi = kai_sqlite_bind_int(stmt.raw, idx, value)
 
+# Bind a floating-point value to a parameter (1-indexed). Returns
+# `SQLITE_OK` on success.
+#[unstable]
+pub fn bind_real(stmt: Stmt, idx: Int, value: Real) : Int / Ffi = kai_sqlite_bind_double(stmt.raw, idx, value)
+
+# Bind SQL NULL to a parameter (1-indexed). Distinct from binding
+# `""` or `0`: only a bound NULL matches `IS NULL`.
+#[unstable]
+pub fn bind_null(stmt: Stmt, idx: Int) : Int / Ffi = kai_sqlite_bind_null(stmt.raw, idx)
+
+# Bind a BLOB to a parameter (1-indexed), given the bytes **hex
+# encoded** (two lowercase or uppercase digits per byte, no prefix or
+# separators). Returns `SQLITE_OK` on success, or `SQLITE_MISUSE`
+# (21) if `hex` is not an even-length run of hex digits.
+#
+# Bytes are hex-encoded at this boundary because kaikai's `String`
+# reaches C NUL-terminated, and binary data contains zero bytes that
+# would truncate it. What SQLite stores is a real BLOB; the encoding
+# covers the crossing only. `encoding/hex` in the stdlib produces the
+# argument.
+#[unstable]
+pub fn bind_blob_hex(stmt: Stmt, idx: Int, hex: String) : Int / Ffi = kai_sqlite_bind_blob_hex(stmt.raw, idx, hex)
+
+# Reset every parameter on the statement back to NULL. Returns
+# `SQLITE_OK` on success. `reset` rewinds execution but *keeps*
+# bindings; a statement being reused for a fresh set of values needs
+# this too, or a parameter the new call does not bind silently keeps
+# the previous call's value.
+#[unstable]
+pub fn clear_bindings(stmt: Stmt) : Int / Ffi = kai_sqlite_clear_bindings(stmt.raw)
+
 # Advance the statement. Returns:
 #   - `SQLITE_ROW` (100): a row is available; read with `column_*`.
 #   - `SQLITE_DONE` (101): no more rows; finalize.
@@ -191,6 +255,32 @@ pub fn column_int(stmt: Stmt, col: Int) : Int / Ffi = kai_sqlite_column_int(stmt
 # automatically as part of the FFI boundary.
 #[unstable]
 pub fn column_text(stmt: Stmt, col: Int) : String / Ffi = kai_sqlite_column_text(stmt.raw, col)
+
+# Read a floating-point column from the current row (0-indexed).
+# Returns `0.0` if the column is NULL or not numeric — check
+# `column_type` to tell a stored `0.0` from an absent value.
+#[unstable]
+pub fn column_real(stmt: Stmt, col: Int) : Real / Ffi = kai_sqlite_column_double(stmt.raw, col)
+
+# Read a BLOB column from the current row (0-indexed) as its **hex
+# encoding** (lowercase, two digits per byte) — see `bind_blob_hex`
+# on why bytes cross encoded. Returns `""` both for a NULL column and
+# for a zero-length BLOB; `column_type` separates them.
+#[unstable]
+pub fn column_blob_hex(stmt: Stmt, col: Int) : String / Ffi = kai_sqlite_column_blob_hex(stmt.raw, col)
+
+# Storage class of the current row's column (0-indexed), as one of
+# the `SQLITE_INTEGER` / `FLOAT` / `TEXT` / `BLOB` / `NULL` constants
+# below. This is the only way to distinguish a stored NULL from the
+# `0` / `""` that the typed readers coerce it to.
+#[unstable]
+pub fn column_type(stmt: Stmt, col: Int) : Int / Ffi = kai_sqlite_column_type(stmt.raw, col)
+
+# Byte length of a TEXT or BLOB column in the current row
+# (0-indexed). Read it after the matching `column_text` /
+# `column_blob_hex` call, per libsqlite3's contract.
+#[unstable]
+pub fn column_bytes(stmt: Stmt, col: Int) : Int / Ffi = kai_sqlite_column_bytes(stmt.raw, col)
 
 # Number of columns in the statement's result set. Valid after
 # `prepare` (before the first `step`), so callers can discover how
@@ -219,6 +309,10 @@ extern "C" fn kai_sqlite_changes(h: Int) : I32 / Ffi
 
 extern "C" fn kai_sqlite_errmsg(h: Int) : String / Ffi
 
+extern "C" fn kai_sqlite_errcode(h: Int) : I32 / Ffi
+
+extern "C" fn kai_sqlite_extended_errcode(h: Int) : I32 / Ffi
+
 # rowid of the most recently inserted row on this connection.
 # Returns 0 if no insert has happened.
 #[unstable]
@@ -233,3 +327,18 @@ pub fn changes(h: Db) : Int / Ffi = kai_sqlite_changes(h.raw)
 # on this connection. Returns the empty string when no error.
 #[unstable]
 pub fn errmsg(h: Db) : String / Ffi = kai_sqlite_errmsg(h.raw)
+
+# Primary result code of the most recent failed call on this
+# connection (`SQLITE_BUSY` 5, `SQLITE_CONSTRAINT` 19, …). Branch on
+# this rather than on `errmsg`: the code is stable across libsqlite3
+# versions and locales, the message text is neither.
+#[unstable]
+pub fn errcode(h: Db) : Int / Ffi = kai_sqlite_errcode(h.raw)
+
+# Extended result code of the most recent failed call: the primary
+# code in the low 8 bits plus a refinement above them
+# (`SQLITE_CONSTRAINT_UNIQUE` 2067 vs plain `SQLITE_CONSTRAINT` 19).
+# *Which* constraint a write violated is usually the question worth
+# branching on.
+#[unstable]
+pub fn extended_errcode(h: Db) : Int / Ffi = kai_sqlite_extended_errcode(h.raw)
