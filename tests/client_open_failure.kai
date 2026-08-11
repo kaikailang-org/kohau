@@ -21,19 +21,19 @@ import actor
 
 import kohau.sqlite.client
 
-fn show_exec(label: String, r: Result[Int, String]) : Unit / Console = match r {
+fn show_exec(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
   Ok(_) -> Stdout.print(label ++ ": ok")
-  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": err " ++ client.error_to_string(e)))
 }
 
-fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+fn show_row(label: String, r: Result[Option[[String]], SqliteError]) : Unit / Console = match r {
   Ok(_) -> Stdout.print(label ++ ": ok")
-  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": err " ++ client.error_to_string(e)))
 }
 
-fn show_scalar(label: String, r: Result[Int, String]) : Unit / Console = match r {
+fn show_scalar(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
   Ok(_) -> Stdout.print(label ++ ": ok")
-  Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": err " ++ client.error_to_string(e)))
 }
 
 fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {

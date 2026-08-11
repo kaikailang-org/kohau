@@ -1,0 +1,107 @@
+# tests/client_types_errors.kai — typed errors, bind affinities and
+# transaction modes over the cell-wrapped client.
+#
+# What this covers that the other client fixtures do not:
+#
+#   1. **Branching on the result code.** A failed write is matched by
+#      its SQLite code, not by its message text — the property the
+#      typed error exists for. The extended code says *which*
+#      constraint broke.
+#   2. **Every bind affinity through the mailbox.** Text, Int, Real,
+#      Blob (hex-encoded) and Null, read back via query_row.
+#   3. **NULL is distinct from ''.** A bound NULL is not matched by
+#      `= ''` and is matched by `IS NULL`.
+#   4. **with_tx_mode.** BEGIN IMMEDIATE commits and rolls back like
+#      the deferred form.
+#   5. **A caller-authored abort reason** carries code 0, so it can
+#      never be mistaken for a SQLite failure.
+#
+# Codes are printed, message text is not: the codes are stable across
+# libsqlite3 versions, the wording is not.
+
+import actor
+
+import kohau.sqlite.client
+
+fn show_code(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
+  Ok(n) -> Stdout.print(label ++ (": Ok(" ++ (int_to_string(n) ++ ")")))
+  Err(e) -> Stdout.print(label ++ (": Err code=" ++ (int_to_string(e.code) ++ (" extended=" ++ int_to_string(e.extended)))))
+}
+
+fn show_cols(label: String, r: Result[Option[[String]], SqliteError]) : Unit / Console = match r {
+  Ok(Some(cols)) -> Stdout.print(label ++ (": [" ++ (join(cols, "|") ++ "]")))
+  Ok(None) -> Stdout.print(label ++ ": absent")
+  Err(e) -> Stdout.print(label ++ (": Err code=" ++ int_to_string(e.code)))
+}
+
+# Join with a separator. Local rather than a stdlib import, matching
+# the discipline the client module itself follows.
+fn join(xs: [String], sep: String) : String = match xs {
+  [] -> ""
+  [x] -> x
+  [x, ...rest] -> x ++ (sep ++ join(rest, sep))
+}
+
+fn count_where(c: Pid[SqlMsg], where_sql: String) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM vals WHERE " ++ where_sql, []) {
+  Ok(n) -> n
+  Err(_) -> -1
+}
+
+fn show_count(label: String, n: Int) : Unit / Console = Stdout.print(label ++ (": " ++ int_to_string(n)))
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  # ---- 1. branching on the code ----
+  let _ = client.exec(c, "CREATE TABLE uniq (id INTEGER PRIMARY KEY)", [])
+  show_code("first insert", client.exec(c, "INSERT INTO uniq VALUES (?)", [BindInt(1)]))
+  # 19 is SQLITE_CONSTRAINT; 1555 refines it to
+  # SQLITE_CONSTRAINT_PRIMARYKEY.
+  show_code("duplicate key", client.exec(c, "INSERT INTO uniq VALUES (?)", [BindInt(1)]))
+  # A missing table is SQLITE_ERROR (1), a different code entirely —
+  # the point of branching on it rather than on wording.
+  show_code("missing table", client.exec(c, "INSERT INTO ghost VALUES (?)", [BindInt(1)]))
+
+  # ---- 2. every bind affinity ----
+  let _ = client.exec(c, "CREATE TABLE vals (t TEXT, i INTEGER, r REAL, b BLOB, n TEXT)", [])
+  show_code(
+    "insert all affinities",
+    client.exec(
+      c,
+      "INSERT INTO vals VALUES (?, ?, ?, ?, ?)",
+      [BindText("hello"), BindInt(42), BindReal(2.5), BindBlob("00ff10"), BindNull],
+    ),
+  )
+  # Read back: the REAL renders through SQLite's own text conversion,
+  # the BLOB through hex() so the golden stays byte-exact.
+  show_cols("read back", client.query_row(c, "SELECT t, i, r, hex(b), quote(n) FROM vals", []))
+
+  # ---- 3. NULL is not '' ----
+  show_count("n = ''", count_where(c, "n = ''"))
+  show_count("n IS NULL", count_where(c, "n IS NULL"))
+
+  # ---- 4. with_tx_mode ----
+  let tx_ok = client.with_tx_mode(c, Immediate, tx => client.exec(tx, "INSERT INTO uniq VALUES (?)", [BindInt(2)]))
+  show_code("immediate commit", tx_ok)
+  show_count("uniq after commit", count_uniq(c))
+
+  let tx_abort = client.with_tx_mode(c, Immediate, tx => {
+    let _ = client.exec(tx, "INSERT INTO uniq VALUES (?)", [BindInt(3)])
+    Err(client.caller_error("caller aborts"))
+  })
+  # A caller-authored abort carries code 0 — never a SQLite code.
+  show_code("immediate abort", tx_abort)
+  show_count("uniq after abort", count_uniq(c))
+
+  client.close(c)
+}
+
+fn count_uniq(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM uniq", []) {
+  Ok(n) -> n
+  Err(_) -> -1
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
+  0
+}

@@ -26,22 +26,22 @@ import actor
 
 import kohau.sqlite.client
 
-fn show_exec(label: String, r: Result[Int, String]) : Unit / Console = match r {
+fn show_exec(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
   Ok(changed) -> Stdout.print(label ++ (": ok changes=" ++ int_to_string(changed)))
-  Err(msg) -> Stdout.print(label ++ (": ERR " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
 }
 
-fn show_scalar(label: String, r: Result[Int, String]) : Unit / Console = match r {
+fn show_scalar(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
   Ok(n) -> Stdout.print(label ++ (": " ++ int_to_string(n)))
-  Err(msg) -> Stdout.print(label ++ (": ERR " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
 }
 
-fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+fn show_row(label: String, r: Result[Option[[String]], SqliteError]) : Unit / Console = match r {
   Ok(opt) -> match opt {
     Some(cols) -> Stdout.print(label ++ (": found data=" ++ first_col(cols)))
     None -> Stdout.print(label ++ ": absent")
   }
-  Err(msg) -> Stdout.print(label ++ (": ERR " ++ msg))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
 }
 
 fn first_col(cols: [String]) : String = match cols {
