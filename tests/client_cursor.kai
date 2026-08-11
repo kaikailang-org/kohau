@@ -1,0 +1,191 @@
+# tests/client_cursor.kai — reading a result set in chunks.
+#
+# A cursor keeps its statement open across mailbox round-trips, so
+# the fixture is mostly about lifetime: who owns the statement, when
+# it is finalized, and what a stale handle does.
+#
+# Cases:
+#   1. fold_chunks walks the whole result set, in chunks, and sees
+#      every row exactly once.
+#   2. The chunking is real — a 100-row scan at 30 rows a chunk
+#      takes four fetches, not one.
+#   3. FoldStop ends the scan early and the rest is never read.
+#   4. A cursor read to its end is gone; fetching again is a typed
+#      error, not a crash.
+#   5. close_cursor on a live cursor has the same effect, and is a
+#      no-op on one already finished.
+#   6. Two cursors over the same SQL advance independently — the
+#      reason a cursor does not take its statement from the cache.
+#   7. An open cursor does not block a write on the same connection.
+
+import actor
+
+import kohau.sqlite.client
+
+fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ (": " ++ s))
+
+fn show_int(label: String, n: Int) : Unit / Console = show(label, int_to_string(n))
+
+# Insert `n` numbered rows.
+fn seed(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+  ()
+} else {
+  let _ = client.exec(c, "INSERT INTO nums (n) VALUES (?)", [BindInt(i)])
+  seed(c, i + 1, n)
+}
+
+# Sum the first column of every row in a chunk.
+fn sum_chunk(rows: [[String]], acc: Int) : Int = match rows {
+  [] -> acc
+  [row, ...rest] -> match row {
+    [] -> sum_chunk(rest, acc)
+    [first, ..._] -> sum_chunk(rest, acc + string_to_int_or(first, 0))
+  }
+}
+
+fn string_to_int_or(s: String, fallback: Int) : Int = match string_to_int(s) {
+  Some(n) -> n
+  None -> fallback
+}
+
+fn row_count(rows: [[String]]) : Int = match rows {
+  [] -> 0
+  [_, ...rest] -> 1 + row_count(rest)
+}
+
+# What a scan accumulates: the running total, and how many chunks it
+# took to get there.
+type Progress = { total: Int, chunks: Int }
+
+fn render_chunk_result(r: Result[Progress, SqliteError]) : String = match r {
+  Ok(p) -> "total=" ++ (int_to_string(p.total) ++ (" chunks=" ++ int_to_string(p.chunks)))
+  Err(e) -> "err code=" ++ int_to_string(e.code)
+}
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  let _ = client.exec(c, "CREATE TABLE nums (n INTEGER PRIMARY KEY)", [])
+  seed(c, 1, 100)
+
+  # ---- 1 and 2. a full scan, in chunks ----
+  # 1..100 sums to 5050; 100 rows at 30 per chunk is 4 fetches (the
+  # fourth returns 10 rows and reports the end).
+  let full = client.fold_chunks(c, "SELECT n FROM nums ORDER BY n", [], 30, Progress { total: 0, chunks: 0 }, (acc, rows) => FoldMore(Progress {
+    total: sum_chunk(rows, acc.total),
+    chunks: acc.chunks + 1,
+  }))
+  show("full scan", render_chunk_result(full))
+
+  # A chunk size past the row count is a single fetch.
+  let one_shot = client.fold_chunks(c, "SELECT n FROM nums ORDER BY n", [], 1000, Progress { total: 0, chunks: 0 }, (acc, rows) => FoldMore(Progress {
+    total: sum_chunk(rows, acc.total),
+    chunks: acc.chunks + 1,
+  }))
+  show("one-shot scan", render_chunk_result(one_shot))
+
+  # An empty result set still yields one (empty) chunk, so a fold
+  # over nothing returns its initial value rather than failing.
+  let empty = client.fold_chunks(c, "SELECT n FROM nums WHERE n > 1000", [], 10, Progress { total: 0, chunks: 0 }, (acc, rows) => FoldMore(Progress {
+    total: sum_chunk(rows, acc.total),
+    chunks: acc.chunks + 1,
+  }))
+  show("empty scan", render_chunk_result(empty))
+
+  # ---- 3. stopping early ----
+  # Stop after the first chunk: only the first 10 rows are summed
+  # (1..10 = 55), and the remaining 90 are never read.
+  let stopped = client.fold_chunks(c, "SELECT n FROM nums ORDER BY n", [], 10, Progress { total: 0, chunks: 0 }, (acc, rows) => FoldStop(Progress {
+    total: sum_chunk(rows, acc.total),
+    chunks: acc.chunks + 1,
+  }))
+  show("stopped early", render_chunk_result(stopped))
+
+  # ---- 4. a finished cursor is gone ----
+  match client.open_cursor(c, "SELECT n FROM nums WHERE n <= 5 ORDER BY n", []) {
+    Err(_) -> show("drain", "open failed")
+    Ok(cur) -> {
+      match client.fetch_chunk(c, cur, 100) {
+        Err(_) -> show("drain", "fetch failed")
+        Ok((rows, done)) -> {
+          show_int("drained rows", row_count(rows))
+          show("drain reports end", if done { "yes" } else { "no" })
+        }
+      }
+      # The cell dropped it when it hit the end.
+      match client.fetch_chunk(c, cur, 10) {
+        Ok(_) -> show("fetch after end", "unexpectedly ok")
+        Err(e) -> show("fetch after end", "err code=" ++ int_to_string(e.code))
+      }
+    }
+  }
+
+  # ---- 5. closing early, and closing twice ----
+  match client.open_cursor(c, "SELECT n FROM nums ORDER BY n", []) {
+    Err(_) -> show("early close", "open failed")
+    Ok(cur) -> {
+      let _ = client.fetch_chunk(c, cur, 5)
+      client.close_cursor(c, cur)
+      match client.fetch_chunk(c, cur, 5) {
+        Ok(_) -> show("fetch after close", "unexpectedly ok")
+        Err(e) -> show("fetch after close", "err code=" ++ int_to_string(e.code))
+      }
+      # Closing an already-closed cursor is silent.
+      client.close_cursor(c, cur)
+      show("double close", "survived")
+    }
+  }
+
+  # ---- 6. two cursors over the same SQL are independent ----
+  let sql = "SELECT n FROM nums ORDER BY n"
+  match client.open_cursor(c, sql, []) {
+    Err(_) -> show("two cursors", "open failed")
+    Ok(a) -> match client.open_cursor(c, sql, []) {
+      Err(_) -> show("two cursors", "second open failed")
+      Ok(b) -> {
+        # Advance A by 10 rows, then read B from its own start. If
+        # they shared a statement, B would resume where A left off.
+        let _ = client.fetch_chunk(c, a, 10)
+        match client.fetch_chunk(c, b, 3) {
+          Err(_) -> show("second cursor starts fresh", "fetch failed")
+          Ok((rows, _)) -> show("second cursor starts fresh", render_first(rows))
+        }
+        match client.fetch_chunk(c, a, 3) {
+          Err(_) -> show("first cursor kept its place", "fetch failed")
+          Ok((rows, _)) -> show("first cursor kept its place", render_first(rows))
+        }
+        client.close_cursor(c, a)
+        client.close_cursor(c, b)
+      }
+    }
+  }
+
+  # ---- 7. an open cursor does not block a write ----
+  match client.open_cursor(c, "SELECT n FROM nums ORDER BY n", []) {
+    Err(_) -> show("write during scan", "open failed")
+    Ok(cur) -> {
+      let _ = client.fetch_chunk(c, cur, 5)
+      match client.exec(c, "INSERT INTO nums (n) VALUES (?)", [BindInt(9999)]) {
+        Ok(_) -> show("write during scan", "ok")
+        Err(e) -> show("write during scan", "err code=" ++ int_to_string(e.code))
+      }
+      client.close_cursor(c, cur)
+    }
+  }
+
+  client.close(c)
+}
+
+# First value of the first row, for showing where a cursor sits.
+fn render_first(rows: [[String]]) : String = match rows {
+  [] -> "(none)"
+  [row, ..._] -> match row {
+    [] -> "(empty row)"
+    [first, ..._] -> first
+  }
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
+  0
+}

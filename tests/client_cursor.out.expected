@@ -1,0 +1,12 @@
+full scan: total=5050 chunks=4
+one-shot scan: total=5050 chunks=1
+empty scan: total=0 chunks=1
+stopped early: total=55 chunks=1
+drained rows: 5
+drain reports end: yes
+fetch after end: err code=0
+fetch after close: err code=0
+double close: survived
+second cursor starts fresh: 1
+first cursor kept its place: 11
+write during scan: ok

@@ -65,6 +65,20 @@
 # Both query forms discover their column count from the prepared
 # statement, so `SELECT *` works without the caller declaring a width.
 #
+# ## Scans larger than memory
+#
+# `QueryRows` materialises its whole result set before replying,
+# which is right for a bounded query and wrong for a table scan. For
+# those there are **cursors**: the cell holds the statement open
+# across round-trips and the caller pulls bounded chunks.
+#
+# What crosses the mailbox is an id, never the statement — a `Stmt`
+# is a pointer into the cell's address space, and its lifetime is
+# not something a recipient could reason about. `fold_chunks` is the
+# form to reach for; `open_cursor` / `fetch_chunk` / `close_cursor`
+# are underneath it for consumers that decide mid-scan whether to
+# continue.
+#
 # ## Compiled statements are reused
 #
 # The cell keeps compiled statements alive between operations, keyed
@@ -98,6 +112,11 @@
 #     column in `hex()` to read bytes exactly. A typed row protocol
 #     (per-column storage class, decoded into a sum type) is the
 #     follow-up; the reply shape would change from `[String]`.
+#   - **Cursors are not transactional on their own.** A cursor sees
+#     the database as it changes under it unless the scan runs
+#     inside `with_tx`. Reading a table while writing to it is
+#     defined but rarely what a caller means; bracket the scan when
+#     it needs a stable view.
 #   - **No restart-on-failure yet.** `with_client` spawns a bare
 #     cell. Wrapping it in ahu's `restartable_cell` so a crashed
 #     connection respawns is the next lane (it needs a reconnection
@@ -177,6 +196,9 @@ pub type SqliteError = { code: Int, extended: Int, message: String }
 #   ScalarInt(n)     — scalar query returned the Int `n`
 #   CacheInfo(c, l)  — statement cache: `c` compilations so far,
 #                      `l` statements currently held
+#   CursorReady(id)  — a cursor was opened; `id` addresses it
+#   Chunk(rows, end) — the next rows from a cursor; `end` is true
+#                      when the result set is exhausted
 #   SqlErr(err)      — any SQLite-side failure, code and message
 #[unstable]
 pub type SqlReply
@@ -186,6 +208,8 @@ pub type SqlReply
   | RowsFound([[String]])
   | ScalarInt(Int)
   | CacheInfo(Int, Int)
+  | CursorReady(Int)
+  | Chunk([[String]], Bool)
   | SqlErr(SqliteError)
 
 # The cell's mailbox message type. Mono-mailbox: kaikai's
@@ -209,6 +233,9 @@ pub type SqlMsg
   | QueryRows(String, [Bind], Pid[SqlMsg])
   | QueryScalar(String, [Bind], Pid[SqlMsg])
   | CacheStats(Pid[SqlMsg])
+  | CursorOpen(String, [Bind], Pid[SqlMsg])
+  | CursorFetch(Int, Int, Pid[SqlMsg])
+  | CursorClose(Int)
   | Shutdown
   | Reply(SqlReply)
 
@@ -407,6 +434,31 @@ fn cache_finalize_all(entries: [CacheEntry]) : Unit / Ffi = match entries {
   }
 }
 
+# ---- cursors ----
+#
+# `query_rows` materialises a whole result set before replying,
+# which is the wrong shape for a scan larger than memory. A cursor
+# keeps the statement open across mailbox round-trips instead, so
+# the caller pulls a bounded chunk at a time.
+#
+# **The caller never sees the statement.** A `Stmt` is an FFI
+# pointer into the cell's address space; sending one across the
+# mailbox would hand out a handle whose lifetime the recipient
+# cannot reason about. The reply carries an `Int` id and the cell
+# keeps the mapping, so a stale id is a typed error rather than a
+# dangling pointer.
+#
+# **A cursor's statement is never the cache's.** A cached statement
+# is reset and rebound by whoever takes it next; a cursor's must
+# survive untouched between fetches, and two cursors over the same
+# SQL need separate statements. So a cursor compiles its own and
+# finalizes it on close — cursors cost a parse, and are for the
+# scans that earn it.
+
+# A statement being consumed across several fetches. `ncols` is read
+# once at open, before the first step.
+type LiveCursor = { id: Int, stmt: Stmt, ncols: Int }
+
 # The reply from one operation, plus the cache after it. Every
 # `run_*` threads the cache through: it may have gained the
 # statement this call compiled, or reordered by the hit it scored.
@@ -514,12 +566,64 @@ fn run_query_scalar(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpRe
   }
 })
 
-# The cell's state: the connection, and the statements compiled
-# against it. `db` is `None` when the open failed, so every request
-# replies a typed `SqlErr` instead of touching SQLite. The cache is
-# meaningless without a connection and stays empty in that case —
-# the statements in it belong to `db` and cannot outlive it.
-type CellState = { db: Option[Db], cache: StmtCache }
+# The cell's state: the connection, the statements compiled against
+# it, and the cursors currently open on it. `db` is `None` when the
+# open failed, so every request replies a typed `SqlErr` instead of
+# touching SQLite. Cache and cursors are meaningless without a
+# connection and stay empty in that case — the statements in them
+# belong to `db` and cannot outlive it.
+#
+# `next_id` only ever counts up, so a closed cursor's id is never
+# handed out again: a fetch on a stale id fails as unknown rather
+# than landing on some later cursor.
+type CellState = { db: Option[Db], cache: StmtCache, cursors: [LiveCursor], next_id: Int }
+
+# Take the cursor with `id` out of the list, returning it and the
+# rest. `None` when no cursor has that id.
+fn cursor_extract(cursors: [LiveCursor], id: Int) : Option[(LiveCursor, [LiveCursor])] = match cursors {
+  [] -> None
+  [c, ...rest] -> if c.id == id {
+    Some((c, rest))
+  } else {
+    match cursor_extract(rest, id) {
+      None -> None
+      Some((found, others)) -> Some((found, [c, ...others]))
+    }
+  }
+}
+
+# Read up to `budget` rows from an open cursor. Returns the rows and
+# whether the result set ended. Rows accumulate reversed and are
+# flipped once, as `collect_rows` does.
+fn fetch_rows(db: Db, cur: LiveCursor, budget: Int, acc: [[String]]) : Result[([[String]], Bool), SqliteError] / Ffi = if budget <= 0 {
+  # Budget spent with the statement still mid-result: more to come.
+  Ok((reverse_rows(acc, []), false))
+} else {
+  let rc = sqlite.step(cur.stmt)
+  if rc == 100 {
+    let row = read_text_cols(cur.stmt, 0, cur.ncols)
+    fetch_rows(db, cur, budget - 1, [row, ...acc])
+  } else if rc == 101 {
+    Ok((reverse_rows(acc, []), true))
+  } else {
+    Err(db_error(db, "step"))
+  }
+}
+
+# Finalize every open cursor's statement. Called before the
+# connection closes, for the same reason the cache is finalized.
+fn cursors_finalize_all(cursors: [LiveCursor]) : Unit / Ffi = match cursors {
+  [] -> ()
+  [c, ...rest] -> {
+    let _ = sqlite.finalize(c.stmt)
+    cursors_finalize_all(rest)
+  }
+}
+
+# The error for an id that names no open cursor — closed already, or
+# never opened. Carries code 0 like every failure that did not come
+# from SQLite.
+fn unknown_cursor(id: Int) : SqliteError = local_error("unknown cursor: " ++ int_to_string(id))
 
 # Close the connection if the cell holds one, finalizing its
 # statements first — libsqlite3 refuses to close a connection with
@@ -528,6 +632,7 @@ type CellState = { db: Option[Db], cache: StmtCache }
 fn close_conn(st: CellState) : Int / Ffi = match st.db {
   Some(d) -> {
     cache_finalize_all(st.cache.entries)
+    cursors_finalize_all(st.cursors)
     sqlite.close(d)
   }
   None -> 0
@@ -550,6 +655,9 @@ fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] 
     Actor.send(reply_to, Reply(CacheInfo(st.cache.compiled, cache_size(st.cache.entries))))
     cell.keep(st)
   }
+  CursorOpen(sql, binds, reply_to) -> cell.keep(handle_cursor_open(st, sql, binds, reply_to))
+  CursorFetch(id, budget, reply_to) -> cell.keep(handle_cursor_fetch(st, id, budget, reply_to))
+  CursorClose(id) -> cell.keep(handle_cursor_close(st, id))
   Shutdown -> {
     let _ = close_conn(st)
     cell.cell_done()
@@ -558,6 +666,81 @@ fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] 
   # A `Reply` never arrives at the cell's own mailbox; if one does
   # (a misrouted message), ignore it and keep running.
   cell.keep(st)
+}
+
+# Compile a statement for a cursor, bind it, and register it under a
+# fresh id. Unlike the pooled operations this does not touch the
+# cache — see §*cursors* on why a cursor owns its statement.
+fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> match sqlite.prepare(d, sql) {
+    None -> {
+      Actor.send(reply_to, Reply(SqlErr(db_error(d, "prepare"))))
+      st
+    }
+    Some(stmt) -> {
+      let rc_bind = apply_binds(stmt, 1, binds)
+      if rc_bind != 0 {
+        let err = db_error(d, "bind")
+        let _ = sqlite.finalize(stmt)
+        Actor.send(reply_to, Reply(SqlErr(err)))
+        st
+      } else {
+        let cur = LiveCursor { id: st.next_id, stmt: stmt, ncols: sqlite.column_count(stmt) }
+        Actor.send(reply_to, Reply(CursorReady(st.next_id)))
+        CellState { db: st.db, cache: st.cache, cursors: [cur, ...st.cursors], next_id: st.next_id + 1 }
+      }
+    }
+  }
+}
+
+# Pull the next chunk from a cursor. A cursor that reaches the end
+# of its result set, or hits an error, is finalized and dropped here
+# — so the common path (read until `end`) needs no explicit close,
+# and a failed cursor cannot be fetched from again.
+fn handle_cursor_fetch(st: CellState, id: Int, budget: Int, reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> match cursor_extract(st.cursors, id) {
+    None -> {
+      Actor.send(reply_to, Reply(SqlErr(unknown_cursor(id))))
+      st
+    }
+    Some((cur, rest)) -> match fetch_rows(d, cur, budget, []) {
+      Err(e) -> {
+        let _ = sqlite.finalize(cur.stmt)
+        Actor.send(reply_to, Reply(SqlErr(e)))
+        CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+      }
+      Ok((rows, done)) -> {
+        Actor.send(reply_to, Reply(Chunk(rows, done)))
+        if done {
+          let _ = sqlite.finalize(cur.stmt)
+          CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+        } else {
+          # Still live: put it back at the front, where the next
+          # fetch will find it first.
+          CellState { db: st.db, cache: st.cache, cursors: [cur, ...rest], next_id: st.next_id }
+        }
+      }
+    }
+  }
+}
+
+# Close a cursor early. Fire-and-forget, and a no-op for an id that
+# is already gone — a caller abandoning a scan should not have to
+# know whether it happened to end on the last chunk.
+fn handle_cursor_close(st: CellState, id: Int) : CellState / Ffi = match cursor_extract(st.cursors, id) {
+  None -> st
+  Some((cur, rest)) -> {
+    let _ = sqlite.finalize(cur.stmt)
+    CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+  }
 }
 
 # Run one operation, send its reply, and return the state to carry
@@ -571,7 +754,7 @@ fn dispatch(st: CellState, reply_to: Pid[SqlMsg], op: (StmtCache, Db) -> OpResul
   Some(d) -> {
     let r = op(st.cache, d)
     Actor.send(reply_to, Reply(r.reply))
-    CellState { db: st.db, cache: r.cache }
+    CellState { db: st.db, cache: r.cache, cursors: st.cursors, next_id: st.next_id }
   }
 }
 
@@ -636,7 +819,7 @@ fn sql_loop(st: CellState) : Unit / Actor[SqlMsg] + Ffi {
 pub fn with_client[R, e](path: String, body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e) : R / Spawn + Ffi + Actor[SqlMsg] + e {
   let db = sqlite.open(path)
   let _ = set_wal(db)
-  let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty() }))
+  let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty(), cursors: [], next_id: 1 }))
   body(pid)
 }
 
@@ -661,6 +844,9 @@ fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
   QueryRows(_, _, _) -> SqlErr(local_error("protocol: stray QueryRows on reply mailbox"))
   QueryScalar(_, _, _) -> SqlErr(local_error("protocol: stray QueryScalar on reply mailbox"))
   CacheStats(_) -> SqlErr(local_error("protocol: stray CacheStats on reply mailbox"))
+  CursorOpen(_, _, _) -> SqlErr(local_error("protocol: stray CursorOpen on reply mailbox"))
+  CursorFetch(_, _, _) -> SqlErr(local_error("protocol: stray CursorFetch on reply mailbox"))
+  CursorClose(_) -> SqlErr(local_error("protocol: stray CursorClose on reply mailbox"))
   Shutdown -> SqlErr(local_error("protocol: stray Shutdown on reply mailbox"))
 }
 
@@ -681,6 +867,8 @@ pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteErro
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to Exec"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to Exec"))
     CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to Exec"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to Exec"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to Exec"))
   }
 }
 
@@ -699,6 +887,8 @@ pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[St
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to QueryRow"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to QueryRow"))
     CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryRow"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to QueryRow"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to QueryRow"))
   }
 }
 
@@ -725,6 +915,8 @@ pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to QueryRows"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to QueryRows"))
     CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryRows"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to QueryRows"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to QueryRows"))
   }
 }
 
@@ -741,6 +933,8 @@ pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, Sq
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to QueryScalar"))
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to QueryScalar"))
     CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryScalar"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to QueryScalar"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to QueryScalar"))
   }
 }
 
@@ -766,6 +960,118 @@ pub fn cache_stats(c: Pid[SqlMsg]) : Result[(Int, Int), SqliteError] / Actor[Sql
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to CacheStats"))
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to CacheStats"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to CacheStats"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to CacheStats"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to CacheStats"))
+  }
+}
+
+# A handle to an open cursor. Wraps the cell-side id rather than
+# exposing a bare `Int`, so it cannot be confused with a row count
+# or a chunk size at a call site.
+#[unstable]
+pub type Cursor = { id: Int }
+
+# Open a cursor over `sql`. The statement stays compiled and
+# positioned in the cell between fetches, so rows arrive in bounded
+# chunks instead of all at once.
+#
+# The caller owns the cursor from here: read it to the end (the last
+# chunk reports `true`, and the cell drops it) or `close_cursor` it
+# early. `fold_chunks` does that bookkeeping and is the better
+# starting point; reach for this when the consumer needs to decide
+# mid-scan whether to keep going.
+#[unstable]
+pub fn open_cursor(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Cursor, SqliteError] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => CursorOpen(sql, binds, me))
+  match expect_reply(reply) {
+    CursorReady(id) -> Ok(Cursor { id: id })
+    SqlErr(e) -> Err(e)
+    ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CursorOpen"))
+    RowFound(_) -> Err(local_error("protocol: RowFound reply to CursorOpen"))
+    RowAbsent -> Err(local_error("protocol: RowAbsent reply to CursorOpen"))
+    RowsFound(_) -> Err(local_error("protocol: RowsFound reply to CursorOpen"))
+    ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to CursorOpen"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to CursorOpen"))
+    Chunk(_, _) -> Err(local_error("protocol: Chunk reply to CursorOpen"))
+  }
+}
+
+# Pull at most `max_rows` more rows. Returns the rows and whether the
+# result set is now exhausted — `true` means this was the last chunk
+# and the cursor is gone; fetching again reports an unknown cursor.
+#
+# A short chunk does **not** mean the end: a chunk can be short only
+# when the rows ran out, but the flag is the signal to trust.
+#[unstable]
+pub fn fetch_chunk(c: Pid[SqlMsg], cur: Cursor, max_rows: Int) : Result[([[String]], Bool), SqliteError] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => CursorFetch(cur.id, max_rows, me))
+  match expect_reply(reply) {
+    Chunk(rows, done) -> Ok((rows, done))
+    SqlErr(e) -> Err(e)
+    ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CursorFetch"))
+    RowFound(_) -> Err(local_error("protocol: RowFound reply to CursorFetch"))
+    RowAbsent -> Err(local_error("protocol: RowAbsent reply to CursorFetch"))
+    RowsFound(_) -> Err(local_error("protocol: RowsFound reply to CursorFetch"))
+    ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to CursorFetch"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to CursorFetch"))
+    CursorReady(_) -> Err(local_error("protocol: CursorReady reply to CursorFetch"))
+  }
+}
+
+# Abandon a cursor before its end. Fire-and-forget, and harmless on
+# a cursor that already finished — a consumer that stops early does
+# not have to know whether it happened to land on the last chunk.
+#[unstable]
+pub fn close_cursor(c: Pid[SqlMsg], cur: Cursor) : Unit / Actor[SqlMsg] = Actor.send(c, CursorClose(cur.id))
+
+# Fold `step` over a result set, `chunk_size` rows at a time, never
+# holding more than one chunk in memory. This is the streaming
+# counterpart of `query_rows` and the form most consumers want.
+#
+# The cursor is closed on every exit: normal end, a SQLite failure
+# mid-scan, or `step` deciding to stop. `step` returns
+# `FoldMore(acc)` to keep going or `FoldStop(acc)` to end the scan early
+# — a `LIMIT` the consumer applies rather than the query.
+#
+# ```kai
+# # Total a column without materialising the table.
+# fold_chunks(c, "SELECT amount FROM ledger", [], 500, 0, (sum, rows) =>
+#   FoldMore(sum + sum_first_column(rows)))
+# ```
+#[unstable]
+pub fn fold_chunks[a, e](c: Pid[SqlMsg], sql: String, binds: [Bind], chunk_size: Int, init: a, step: (a, [[String]]) -> FoldStep[a] / Actor[SqlMsg] + e) : Result[a, SqliteError] / Actor[SqlMsg] + e = match open_cursor(c, sql, binds) {
+  Err(e) -> Err(e)
+  Ok(cur) -> fold_loop(c, cur, chunk_size, init, step)
+}
+
+# What a `fold_chunks` step decides after seeing a chunk.
+#[unstable]
+pub type FoldStep[a]
+  = FoldMore(a)
+  | FoldStop(a)
+
+# Drive the cursor until the result set ends, `step` stops, or a
+# fetch fails. Closes the cursor on the two paths where the cell has
+# not already dropped it.
+fn fold_loop[a, e](c: Pid[SqlMsg], cur: Cursor, chunk_size: Int, acc: a, step: (a, [[String]]) -> FoldStep[a] / Actor[SqlMsg] + e) : Result[a, SqliteError] / Actor[SqlMsg] + e = match fetch_chunk(c, cur, chunk_size) {
+  # A failed fetch has already finalized the cursor cell-side.
+  Err(e) -> Err(e)
+  Ok((rows, done)) -> match step(acc, rows) {
+    FoldStop(final) -> {
+      # Stopping early leaves the cursor open unless this was the
+      # last chunk; closing an already-dropped one is a no-op.
+      if done {
+        ()
+      } else {
+        close_cursor(c, cur)
+      }
+      Ok(final)
+    }
+    FoldMore(next) -> if done {
+      Ok(next)
+    } else {
+      fold_loop(c, cur, chunk_size, next, step)
+    }
   }
 }
 
