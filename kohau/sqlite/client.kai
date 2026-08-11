@@ -65,6 +65,16 @@
 # Both query forms discover their column count from the prepared
 # statement, so `SELECT *` works without the caller declaring a width.
 #
+# ## Compiled statements are reused
+#
+# The cell keeps compiled statements alive between operations, keyed
+# by SQL text, so repeating a statement skips the parse. This is
+# invisible except through `cache_stats` — and through the cost. It
+# rewards binding values rather than splicing them: bound, a
+# statement is one cache entry however many values run through it;
+# spliced, every distinct value is a new entry that evicts the
+# others. See the §*prepared statement cache* section below.
+#
 # ## Binds
 #
 # Values are bound positionally (1-indexed, SQLite convention) via
@@ -165,6 +175,8 @@ pub type SqliteError = { code: Int, extended: Int, message: String }
 #   RowsFound(rows)  — multi-row query; every row's TEXT columns,
 #                      in result-set order (empty list = no rows)
 #   ScalarInt(n)     — scalar query returned the Int `n`
+#   CacheInfo(c, l)  — statement cache: `c` compilations so far,
+#                      `l` statements currently held
 #   SqlErr(err)      — any SQLite-side failure, code and message
 #[unstable]
 pub type SqlReply
@@ -173,6 +185,7 @@ pub type SqlReply
   | RowAbsent
   | RowsFound([[String]])
   | ScalarInt(Int)
+  | CacheInfo(Int, Int)
   | SqlErr(SqliteError)
 
 # The cell's mailbox message type. Mono-mailbox: kaikai's
@@ -195,6 +208,7 @@ pub type SqlMsg
   | QueryRow(String, [Bind], Pid[SqlMsg])
   | QueryRows(String, [Bind], Pid[SqlMsg])
   | QueryScalar(String, [Bind], Pid[SqlMsg])
+  | CacheStats(Pid[SqlMsg])
   | Shutdown
   | Reply(SqlReply)
 
@@ -270,62 +284,185 @@ fn read_text_cols(stmt: Stmt, col: Int, n: Int) : [String] / Ffi = if col >= n {
   [v, ...read_text_cols(stmt, col + 1, n)]
 }
 
-# Execute a no-row statement: prepare, bind, step once, finalize.
-# Returns the pid-free reply payload to send back. Atomic — the
-# statement is fully consumed before this returns.
-fn run_exec(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
-  None -> SqlErr(db_error(db, "prepare"))
-  Some(stmt) -> {
-    let rc_bind = apply_binds(stmt, 1, binds)
-    if rc_bind != 0 {
-      let _ = sqlite.finalize(stmt)
-      SqlErr(db_error(db, "bind"))
-    } else {
-      let rc_step = sqlite.step(stmt)
-      let changed = sqlite.changes(db)
-      let _ = sqlite.finalize(stmt)
-      # SQLITE_DONE (101) is success for a no-row statement.
-      if rc_step == 101 {
-        ExecOk(changed)
-      } else {
-        SqlErr(db_error(db, "step"))
-      }
+# ---- prepared statement cache ----
+#
+# Compiling SQL is the expensive half of a small statement, and a
+# cell serving one connection runs the same handful of statements
+# over and over. The cache keeps compiled statements alive across
+# operations, keyed by their SQL text.
+#
+# **An association list, not a Map.** At this size a linear scan is
+# a few string comparisons — nothing against the SQL parse it saves —
+# and the list order *is* the recency order, so the LRU needs no
+# second structure. Entries are held most-recently-used first: a hit
+# moves its entry to the front, an insertion past capacity finalizes
+# the entry that fell off the back.
+#
+# Keying on exact SQL text is what makes this safe: two calls share
+# a statement only when they are the same statement. Values never
+# enter the key — they are bound, never spliced — so the cache
+# cannot confuse two calls that differ only in their parameters.
+#
+# `prepare_v2` handles the one invalidation case that matters: when
+# DDL changes the schema under a cached statement, libsqlite3
+# recompiles it inside `step` rather than failing.
+
+# One compiled statement and the SQL it came from.
+type CacheEntry = { sql: String, stmt: Stmt }
+
+# The cell's compiled-statement store. `entries` is ordered
+# most-recently-used first. `compiled` counts how many times the
+# cell has called `prepare` — the cache's whole purpose is to keep
+# that number below the operation count, and `cache_stats` exposes
+# it so a caller (or a fixture) can check that it does.
+type StmtCache = { entries: [CacheEntry], capacity: Int, compiled: Int }
+
+# How many statements a cell keeps compiled. Sized for the working
+# set of a repository-style caller (a handful of CRUD statements,
+# plus BEGIN / COMMIT / ROLLBACK) with room to spare; every entry is
+# one small libsqlite3 allocation.
+const CACHE_CAPACITY : Int = 16
+
+fn cache_empty() : StmtCache = StmtCache { entries: [], capacity: CACHE_CAPACITY, compiled: 0 }
+
+# Look `sql` up, returning its entry and the remaining entries with
+# it removed. The caller puts it back at the front, which is what
+# makes a hit "touch" the entry.
+fn cache_extract(entries: [CacheEntry], sql: String) : Option[(CacheEntry, [CacheEntry])] = match entries {
+  [] -> None
+  [e, ...rest] -> if e.sql == sql {
+    Some((e, rest))
+  } else {
+    match cache_extract(rest, sql) {
+      None -> None
+      Some((found, others)) -> Some((found, [e, ...others]))
     }
   }
 }
+
+# Drop and finalize everything past `n` entries. Returns the kept
+# prefix. Finalizing is what frees the libsqlite3 statement; losing
+# the handle without it leaks until the connection closes.
+fn cache_trim(entries: [CacheEntry], n: Int) : [CacheEntry] / Ffi = match entries {
+  [] -> []
+  [e, ...rest] -> if n <= 0 {
+    let _ = sqlite.finalize(e.stmt)
+    cache_trim(rest, 0)
+  } else {
+    [e, ...cache_trim(rest, n - 1)]
+  }
+}
+
+# A statement ready to run, plus the cache that now owns it.
+type Prepared = { stmt: Stmt, cache: StmtCache }
+
+# Get a statement for `sql`, compiling it only on a miss. Either way
+# the returned statement is reset and has no bindings left from a
+# previous use, so the caller can bind straight onto it.
+fn cache_take(cache: StmtCache, db: Db, sql: String) : Result[Prepared, SqliteError] / Ffi = match cache_extract(cache.entries, sql) {
+  Some((hit, rest)) -> {
+    # A hit may be mid-iteration if a previous query stopped early
+    # (query_row on a multi-row result), and it still carries that
+    # call's bindings. Reset rewinds it and releases any lock it
+    # holds; clear_bindings drops the stale values, so a parameter
+    # this call does not bind reads as NULL rather than as whatever
+    # the last call put there.
+    let _ = sqlite.reset(hit.stmt)
+    let _ = sqlite.clear_bindings(hit.stmt)
+    Ok(Prepared { stmt: hit.stmt, cache: StmtCache { entries: [hit, ...rest], capacity: cache.capacity, compiled: cache.compiled } })
+  }
+  None -> match sqlite.prepare(db, sql) {
+    None -> Err(db_error(db, "prepare"))
+    Some(stmt) -> {
+      let entry = CacheEntry { sql: sql, stmt: stmt }
+      let kept = cache_trim([entry, ...cache.entries], cache.capacity)
+      Ok(Prepared { stmt: stmt, cache: StmtCache { entries: kept, capacity: cache.capacity, compiled: cache.compiled + 1 } })
+    }
+  }
+}
+
+# Hand a statement back after an operation. Resetting here rather
+# than at the next take is what keeps a half-consumed query from
+# holding its read lock for as long as it sits in the cache.
+fn cache_release(stmt: Stmt) : Unit / Ffi {
+  let _ = sqlite.reset(stmt)
+  ()
+}
+
+# Number of entries the cache holds.
+fn cache_size(xs: [CacheEntry]) : Int = match xs {
+  [] -> 0
+  [_, ...rest] -> 1 + cache_size(rest)
+}
+
+# Finalize every cached statement. Called before the connection
+# closes: a statement outliving its connection is a use-after-free
+# waiting to happen, and libsqlite3 refuses to close a connection
+# that still has live statements.
+fn cache_finalize_all(entries: [CacheEntry]) : Unit / Ffi = match entries {
+  [] -> ()
+  [e, ...rest] -> {
+    let _ = sqlite.finalize(e.stmt)
+    cache_finalize_all(rest)
+  }
+}
+
+# The reply from one operation, plus the cache after it. Every
+# `run_*` threads the cache through: it may have gained the
+# statement this call compiled, or reordered by the hit it scored.
+type OpResult = { reply: SqlReply, cache: StmtCache }
+
+# Bind, then run `k` on the bound statement. Factors out the take /
+# bind / release sequence every operation shares, so each one is
+# left with only what it does differently. The statement is released
+# on every path, including the failing ones.
+fn with_stmt(cache: StmtCache, db: Db, sql: String, binds: [Bind], k: (Stmt) -> SqlReply / Ffi) : OpResult / Ffi = match cache_take(cache, db, sql) {
+  Err(e) -> OpResult { reply: SqlErr(e), cache: cache }
+  Ok(p) -> {
+    let rc_bind = apply_binds(p.stmt, 1, binds)
+    if rc_bind != 0 {
+      let err = db_error(db, "bind")
+      cache_release(p.stmt)
+      OpResult { reply: SqlErr(err), cache: p.cache }
+    } else {
+      let reply = k(p.stmt)
+      cache_release(p.stmt)
+      OpResult { reply: reply, cache: p.cache }
+    }
+  }
+}
+
+# Execute a no-row statement: bind, step once. Atomic — the
+# statement is fully consumed before this returns.
+fn run_exec(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  let rc_step = sqlite.step(stmt)
+  let changed = sqlite.changes(db)
+  # SQLITE_DONE (101) is success for a no-row statement.
+  if rc_step == 101 {
+    ExecOk(changed)
+  } else {
+    SqlErr(db_error(db, "step"))
+  }
+})
 
 # Execute a ≤1-row statement. The column count is discovered from
 # the prepared statement, the same way `run_query_rows` does it, so
 # a caller can select any number of columns without declaring the
 # width. Returns RowFound(cols), RowAbsent, or SqlErr.
-fn run_query_row(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
-  None -> SqlErr(db_error(db, "prepare"))
-  Some(stmt) -> {
-    let rc_bind = apply_binds(stmt, 1, binds)
-    if rc_bind != 0 {
-      let _ = sqlite.finalize(stmt)
-      SqlErr(db_error(db, "bind"))
-    } else {
-      # column_count is valid after prepare, before the first step.
-      let ncols = sqlite.column_count(stmt)
-      let rc_step = sqlite.step(stmt)
-      # SQLITE_ROW (100): a row is available.
-      if rc_step == 100 {
-        let cols = read_text_cols(stmt, 0, ncols)
-        let _ = sqlite.finalize(stmt)
-        RowFound(cols)
-      } else {
-        let _ = sqlite.finalize(stmt)
-        # SQLITE_DONE (101): no rows; anything else is an error.
-        if rc_step == 101 {
-          RowAbsent
-        } else {
-          SqlErr(db_error(db, "step"))
-        }
-      }
-    }
+fn run_query_row(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  # column_count is valid after prepare, before the first step.
+  let ncols = sqlite.column_count(stmt)
+  let rc_step = sqlite.step(stmt)
+  # SQLITE_ROW (100): a row is available.
+  if rc_step == 100 {
+    RowFound(read_text_cols(stmt, 0, ncols))
+  } else if rc_step == 101 {
+    # SQLITE_DONE: no rows.
+    RowAbsent
+  } else {
+    SqlErr(db_error(db, "step"))
   }
-}
+})
 
 # Step a prepared statement to exhaustion, accumulating every row's
 # TEXT columns. `ncols` is read once from `sqlite.column_count` and
@@ -358,99 +495,84 @@ fn reverse_rows(xs: [[String]], acc: [[String]]) : [[String]] = match xs {
 # Execute a multi-row statement. Discovers the column count from the
 # prepared statement (`sqlite.column_count`), then steps to
 # exhaustion. Returns RowsFound(rows) — possibly empty — or SqlErr.
-fn run_query_rows(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
-  None -> SqlErr(db_error(db, "prepare"))
-  Some(stmt) -> {
-    let rc_bind = apply_binds(stmt, 1, binds)
-    if rc_bind != 0 {
-      let _ = sqlite.finalize(stmt)
-      SqlErr(db_error(db, "bind"))
-    } else {
-      # column_count is valid after prepare, before the first step.
-      let ncols = sqlite.column_count(stmt)
-      let result = collect_rows(db, stmt, ncols, [])
-      let _ = sqlite.finalize(stmt)
-      match result {
-        Ok(rows) -> RowsFound(rows)
-        Err(msg) -> SqlErr(msg)
-      }
-    }
+fn run_query_rows(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  # column_count is valid after prepare, before the first step.
+  let ncols = sqlite.column_count(stmt)
+  match collect_rows(db, stmt, ncols, []) {
+    Ok(rows) -> RowsFound(rows)
+    Err(e) -> SqlErr(e)
   }
-}
+})
 
 # Execute a single-Int-column statement (COUNT, MAX, scalar SELECT).
-fn run_query_scalar(db: Db, sql: String, binds: [Bind]) : SqlReply / Ffi = match sqlite.prepare(db, sql) {
-  None -> SqlErr(db_error(db, "prepare"))
-  Some(stmt) -> {
-    let rc_bind = apply_binds(stmt, 1, binds)
-    if rc_bind != 0 {
-      let _ = sqlite.finalize(stmt)
-      SqlErr(db_error(db, "bind"))
-    } else {
-      let rc_step = sqlite.step(stmt)
-      if rc_step == 100 {
-        let n = sqlite.column_int(stmt, 0)
-        let _ = sqlite.finalize(stmt)
-        ScalarInt(n)
-      } else {
-        let _ = sqlite.finalize(stmt)
-        SqlErr(db_error(db, "step"))
-      }
-    }
+fn run_query_scalar(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  let rc_step = sqlite.step(stmt)
+  if rc_step == 100 {
+    ScalarInt(sqlite.column_int(stmt, 0))
+  } else {
+    SqlErr(db_error(db, "step"))
   }
-}
+})
 
-# Run `op` against the live connection, or reply the typed
-# open-failure when the cell was spawned without one (see
-# `with_client` on the open-failure path).
-fn with_conn(db: Option[Db], op: (Db) -> SqlReply / Ffi) : SqlReply / Ffi = match db {
-  Some(d) -> op(d)
-  None -> SqlErr(local_error("no connection: open failed"))
-}
+# The cell's state: the connection, and the statements compiled
+# against it. `db` is `None` when the open failed, so every request
+# replies a typed `SqlErr` instead of touching SQLite. The cache is
+# meaningless without a connection and stays empty in that case —
+# the statements in it belong to `db` and cannot outlive it.
+type CellState = { db: Option[Db], cache: StmtCache }
 
-# Close the connection if the cell holds one. Returns the SQLite rc
-# (`SQLITE_OK` when there was nothing to close).
-fn close_conn(db: Option[Db]) : Int / Ffi = match db {
-  Some(d) -> sqlite.close(d)
+# Close the connection if the cell holds one, finalizing its
+# statements first — libsqlite3 refuses to close a connection with
+# live statements, and the handles die with it either way. Returns
+# the SQLite rc (`SQLITE_OK` when there was nothing to close).
+fn close_conn(st: CellState) : Int / Ffi = match st.db {
+  Some(d) -> {
+    cache_finalize_all(st.cache.entries)
+    sqlite.close(d)
+  }
   None -> 0
 }
 
-# The cell's step function. State is the connection handle — `None`
-# when the open failed, so every request replies a typed `SqlErr`
-# instead of touching SQLite. Each request runs to completion,
-# replies, and keeps the same db.
+# The cell's step function. Each request runs to completion, replies,
+# and carries the (possibly grown or reordered) cache forward.
 #
-# `QueryRow` reads a single TEXT column (`ncols = 1`) — the
-# `find`-by-primary-key shape henua uses against its
-# `(id TEXT, data TEXT)` schema, where `find` selects only `data`.
-# `QueryRows` discovers its column count at runtime via
-# `sqlite.column_count`, so it handles arbitrary SELECTs (including
-# `SELECT *`) without the caller declaring a width.
-fn sql_step(db: Option[Db], msg: SqlMsg) : StepResult[Option[Db]] / Actor[SqlMsg] + Ffi = match msg {
-  Exec(sql, binds, reply_to) -> {
-    Actor.send(reply_to, Reply(with_conn(db, d => run_exec(d, sql, binds))))
-    cell.keep(db)
-  }
-  QueryRow(sql, binds, reply_to) -> {
-    Actor.send(reply_to, Reply(with_conn(db, d => run_query_row(d, sql, binds))))
-    cell.keep(db)
-  }
-  QueryRows(sql, binds, reply_to) -> {
-    Actor.send(reply_to, Reply(with_conn(db, d => run_query_rows(d, sql, binds))))
-    cell.keep(db)
-  }
-  QueryScalar(sql, binds, reply_to) -> {
-    Actor.send(reply_to, Reply(with_conn(db, d => run_query_scalar(d, sql, binds))))
-    cell.keep(db)
+# Both query forms discover their column count from the prepared
+# statement, so they handle arbitrary SELECTs — including `SELECT *`
+# — without the caller declaring a width.
+fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] + Ffi = match msg {
+  Exec(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_exec(c, d, sql, binds)))
+  QueryRow(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_row(c, d, sql, binds)))
+  QueryRows(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_rows(c, d, sql, binds)))
+  QueryScalar(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_scalar(c, d, sql, binds)))
+  CacheStats(reply_to) -> {
+    # Answered from the cache alone: it needs no connection, so it
+    # reports honestly even on a cell whose open failed.
+    Actor.send(reply_to, Reply(CacheInfo(st.cache.compiled, cache_size(st.cache.entries))))
+    cell.keep(st)
   }
   Shutdown -> {
-    let _ = close_conn(db)
+    let _ = close_conn(st)
     cell.cell_done()
   }
-  Reply(_) -> 
+  Reply(_) ->
   # A `Reply` never arrives at the cell's own mailbox; if one does
   # (a misrouted message), ignore it and keep running.
-  cell.keep(db)
+  cell.keep(st)
+}
+
+# Run one operation, send its reply, and return the state to carry
+# forward. With no connection the reply is the typed open-failure and
+# the state is untouched.
+fn dispatch(st: CellState, reply_to: Pid[SqlMsg], op: (StmtCache, Db) -> OpResult / Ffi) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> {
+    let r = op(st.cache, d)
+    Actor.send(reply_to, Reply(r.reply))
+    CellState { db: st.db, cache: r.cache }
+  }
 }
 
 # The cell dispatch loop, spawned as its own fiber by `with_client`.
@@ -458,10 +580,10 @@ fn sql_step(db: Option[Db], msg: SqlMsg) : StepResult[Option[Db]] / Actor[SqlMsg
 # can hand-spawn it (see the module header on why `with_cell` is not
 # used: it shares one row variable between step and body, which would
 # leak this loop's `Ffi` into `with_client`'s body).
-fn sql_loop(db: Option[Db]) : Unit / Actor[SqlMsg] + Ffi {
+fn sql_loop(st: CellState) : Unit / Actor[SqlMsg] + Ffi {
   let msg = Actor.receive()
-  match sql_step(db, msg) {
-    Continue(d) -> sql_loop(d)
+  match sql_step(st, msg) {
+    Continue(s) -> sql_loop(s)
     Done -> ()
   }
 }
@@ -514,7 +636,7 @@ fn sql_loop(db: Option[Db]) : Unit / Actor[SqlMsg] + Ffi {
 pub fn with_client[R, e](path: String, body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e) : R / Spawn + Ffi + Actor[SqlMsg] + e {
   let db = sqlite.open(path)
   let _ = set_wal(db)
-  let pid = spawn_actor(() => sql_loop(db))
+  let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty() }))
   body(pid)
 }
 
@@ -538,6 +660,7 @@ fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
   QueryRow(_, _, _) -> SqlErr(local_error("protocol: stray QueryRow on reply mailbox"))
   QueryRows(_, _, _) -> SqlErr(local_error("protocol: stray QueryRows on reply mailbox"))
   QueryScalar(_, _, _) -> SqlErr(local_error("protocol: stray QueryScalar on reply mailbox"))
+  CacheStats(_) -> SqlErr(local_error("protocol: stray CacheStats on reply mailbox"))
   Shutdown -> SqlErr(local_error("protocol: stray Shutdown on reply mailbox"))
 }
 
@@ -557,6 +680,7 @@ pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteErro
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to Exec"))
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to Exec"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to Exec"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to Exec"))
   }
 }
 
@@ -574,6 +698,7 @@ pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[St
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to QueryRow"))
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to QueryRow"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to QueryRow"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryRow"))
   }
 }
 
@@ -599,6 +724,7 @@ pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]
     RowFound(_) -> Err(local_error("protocol: RowFound reply to QueryRows"))
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to QueryRows"))
     ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to QueryRows"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryRows"))
   }
 }
 
@@ -614,6 +740,32 @@ pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, Sq
     RowFound(_) -> Err(local_error("protocol: RowFound reply to QueryScalar"))
     RowAbsent -> Err(local_error("protocol: RowAbsent reply to QueryScalar"))
     RowsFound(_) -> Err(local_error("protocol: RowsFound reply to QueryScalar"))
+    CacheInfo(_, _) -> Err(local_error("protocol: CacheInfo reply to QueryScalar"))
+  }
+}
+
+# Ask the cell about its statement cache. Returns
+# `Ok((compiled, held))`: how many times it has compiled a statement
+# since it spawned, and how many it currently holds.
+#
+# `compiled` is the number worth watching. It rises once per *new*
+# statement and stays flat while the same SQL is reused, so a caller
+# whose workload is a fixed set of statements should see it settle.
+# One that keeps climbing means SQL is being built with values
+# spliced in — each variant is a distinct cache key that evicts the
+# others — which is also the shape that invites injection. Bind
+# values instead.
+#[unstable]
+pub fn cache_stats(c: Pid[SqlMsg]) : Result[(Int, Int), SqliteError] / Actor[SqlMsg] {
+  let reply = cell.ask(c, me => CacheStats(me))
+  match expect_reply(reply) {
+    CacheInfo(compiled, held) -> Ok((compiled, held))
+    SqlErr(e) -> Err(e)
+    ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CacheStats"))
+    RowFound(_) -> Err(local_error("protocol: RowFound reply to CacheStats"))
+    RowAbsent -> Err(local_error("protocol: RowAbsent reply to CacheStats"))
+    RowsFound(_) -> Err(local_error("protocol: RowsFound reply to CacheStats"))
+    ScalarInt(_) -> Err(local_error("protocol: ScalarInt reply to CacheStats"))
   }
 }
 

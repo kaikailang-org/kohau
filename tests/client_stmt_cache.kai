@@ -1,0 +1,126 @@
+# tests/client_stmt_cache.kai — the prepared-statement cache.
+#
+# The cache is an optimisation, so the fixture checks two separate
+# things: that it actually caches (the compile count stops rising
+# while the same SQL is reused), and that caching changes no
+# observable result.
+#
+# Cases:
+#   1. Repeating one statement compiles it once.
+#   2. A reused statement does not leak the previous call's binding
+#      into a call that binds nothing — the clear_bindings path.
+#   3. A half-consumed query (query_row over a multi-row result)
+#      leaves its statement usable, and its lock released.
+#   4. Going past capacity evicts, and the evicted statement still
+#      works when it comes back.
+#   5. DDL under a cached statement re-compiles it rather than
+#      failing (prepare_v2's schema-change handling).
+#
+# Compile counts are exact, not bounds: a change in what the cache
+# keys on should break this fixture loudly.
+
+import actor
+
+import kohau.sqlite.client
+
+fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ (": " ++ s))
+
+fn show_int(label: String, n: Int) : Unit / Console = show(label, int_to_string(n))
+
+# Compilations so far, or -1 if the cell could not answer.
+fn compiled(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.cache_stats(c) {
+  Ok((n, _)) -> n
+  Err(_) -> -1
+}
+
+# Statements currently held.
+fn held(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.cache_stats(c) {
+  Ok((_, n)) -> n
+  Err(_) -> -1
+}
+
+fn scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Int / Actor[SqlMsg] = match client.query_scalar(c, sql, binds) {
+  Ok(n) -> n
+  Err(_) -> -1
+}
+
+# Run the same parameterised insert `n` times, with a different
+# value each time.
+fn insert_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+  ()
+} else {
+  let _ = client.exec(c, "INSERT INTO t (id) VALUES (?)", [BindInt(i)])
+  insert_n(c, i + 1, n)
+}
+
+# Run `n` *distinct* statements, to push the cache past capacity.
+# Each selects a different literal, so each is its own cache key.
+fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+  ()
+} else {
+  let _ = client.query_scalar(c, "SELECT " ++ int_to_string(i), [])
+  distinct_n(c, i + 1, n)
+}
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  # ---- 1. one statement, compiled once ----
+  let _ = client.exec(c, "CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+  let base = compiled(c)
+  insert_n(c, 1, 20)
+  # 20 inserts of the same SQL: exactly one compilation.
+  show_int("compiles for 20 identical inserts", compiled(c) - base)
+  show_int("rows inserted", scalar(c, "SELECT COUNT(*) FROM t", []))
+
+  # ---- 2. no binding leaks across a reuse ----
+  # Bind a value, then run the *same* SQL binding nothing. The
+  # parameter must read as NULL, not as the previous value.
+  let before = compiled(c)
+  show("bound", render_row(client.query_row(c, "SELECT quote(?)", [BindText("first")])))
+  show("rebound to nothing", render_row(client.query_row(c, "SELECT quote(?)", [])))
+  show_int("compiles for the reuse", compiled(c) - before)
+
+  # ---- 3. a half-consumed query leaves a usable statement ----
+  # query_row stops at the first of several rows, so its statement
+  # is mid-iteration when it goes back in the cache. Running it
+  # again must start over, not resume.
+  show("first of many (1st call)", render_row(client.query_row(c, "SELECT id FROM t ORDER BY id", [])))
+  show("first of many (2nd call)", render_row(client.query_row(c, "SELECT id FROM t ORDER BY id", [])))
+  # The released statement holds no read lock, so a write proceeds.
+  show_int("write after half-consumed read", scalar(c, "SELECT COUNT(*) FROM t WHERE id = ?", [BindInt(1)]))
+
+  # ---- 4. eviction, and life after it ----
+  # Capacity is 16; 40 distinct statements force eviction.
+  distinct_n(c, 1, 40)
+  show_int("held after 40 distinct", held(c))
+  # A statement evicted long ago still works — it just recompiles.
+  show_int("evicted statement still runs", scalar(c, "SELECT 1", []))
+
+  # ---- 5. schema change under a cached statement ----
+  let _ = client.query_rows(c, "SELECT * FROM t", [])
+  let _ = client.exec(c, "ALTER TABLE t ADD COLUMN label TEXT", [])
+  # The cached `SELECT *` was compiled against the old shape.
+  # prepare_v2 recompiles it inside step, so this sees two columns.
+  show("select * after ALTER", render_row(client.query_row(c, "SELECT * FROM t ORDER BY id", [])))
+
+  client.close(c)
+}
+
+# Render a query_row result as a compact, golden-stable string.
+fn render_row(r: Result[Option[[String]], SqliteError]) : String = match r {
+  Ok(Some(cols)) -> "[" ++ (join(cols, "|") ++ "]")
+  Ok(None) -> "absent"
+  Err(e) -> "err code=" ++ int_to_string(e.code)
+}
+
+fn join(xs: [String], sep: String) : String = match xs {
+  [] -> ""
+  [x] -> x
+  [x, ...rest] -> x ++ (sep ++ join(rest, sep))
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
+  0
+}

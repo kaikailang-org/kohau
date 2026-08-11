@@ -1,0 +1,11 @@
+compiles for 20 identical inserts: 1
+rows inserted: 20
+bound: ['first']
+rebound to nothing: [NULL]
+compiles for the reuse: 1
+first of many (1st call): [1]
+first of many (2nd call): [1]
+write after half-consumed read: 1
+held after 40 distinct: 16
+evicted statement still runs: 1
+select * after ALTER: [1|]
