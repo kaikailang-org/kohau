@@ -69,7 +69,11 @@ SHIM_H := c/sqlite_shim.h
 PG_SHIM_C := c/postgres_shim.c
 PG_SHIM_H := c/postgres_shim.h
 
-KAI_CFLAGS = -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
+# C11, not C99: the shim's hex scratch buffer is `_Thread_local`, a
+# C11 keyword. A kaikai fiber can resume on a different OS thread
+# than the one that parked it, so a shared static buffer would tear
+# under concurrent readers.
+KAI_CFLAGS = -std=c11 -O2 -Wno-unused-function -Wno-unused-variable \
              $(SQLITE_INC_FLAG) -include $(SHIM_H) $(SHIM_C) \
              $(SQLITE_LIB_FLAG) -lsqlite3
 

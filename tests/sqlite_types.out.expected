@@ -1,0 +1,21 @@
+open: ok
+real round-trip: ok
+real column_type: ok
+null is SQLITE_NULL: ok
+'' is SQLITE_TEXT: ok
+0 is SQLITE_INTEGER: ok
+null reads as '': ok
+blob bind rc: ok
+blob round-trip: ok
+blob column_type: ok
+blob byte length: ok
+odd-length hex: ok
+non-hex digit: ok
+empty blob binds: ok
+bound value: ok
+survives reset: ok
+cleared to NULL: ok
+constraint rc: ok
+errcode: ok
+extended errcode: ok
+close: ok
