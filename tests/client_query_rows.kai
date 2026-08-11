@@ -22,7 +22,7 @@ import kohau.sqlite.client
 # Render a result set as "n: [a|b|c] [d|e|f]" for a stable golden.
 # The rendered rows are appended only when there are rows, so an
 # empty result set prints "n: 0" with no trailing space.
-fn show_rows(label: String, r: Result[[[String]], String]) : Unit / Console = match r {
+fn show_rows(label: String, r: Result[[[String]], SqliteError]) : Unit / Console = match r {
   Err(_) -> Stdout.print(label ++ ": err")
   Ok(rows) -> {
     let n = row_count(rows)

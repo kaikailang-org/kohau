@@ -1,0 +1,11 @@
+first insert: Ok(1)
+duplicate key: Err code=19 extended=1555
+missing table: Err code=1 extended=1
+insert all affinities: Ok(1)
+read back: [hello|42|2.5|00FF10|NULL]
+n = '': 0
+n IS NULL: 1
+immediate commit: Ok(1)
+uniq after commit: 2
+immediate abort: Err code=0 extended=0
+uniq after abort: 2

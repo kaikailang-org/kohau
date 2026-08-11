@@ -26,7 +26,7 @@ fn count(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.query_scalar(c, "S
   Err(_) -> -1
 }
 
-fn show_tx(label: String, r: Result[Int, String]) : Unit / Console = match r {
+fn show_tx(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
   Ok(n) -> Stdout.print(label ++ (": Ok(" ++ (int_to_string(n) ++ ")")))
   Err(_) -> Stdout.print(label ++ ": Err")
 }
@@ -51,7 +51,7 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   # rolled back, count stays at 2.
   let tx2 = client.with_tx(c, tx => {
     let _ = client.exec(tx, "INSERT INTO t VALUES (?, ?)", [BindText("c"), BindText("3")])
-    Err("caller aborts the tx")
+    Err(client.caller_error("caller aborts the tx"))
   })
   show_tx("rollback tx", tx2)
   show_count("after rollback", count(c))
