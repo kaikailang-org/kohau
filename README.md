@@ -9,9 +9,10 @@ the DDD vocabulary of [henua](https://github.com/kaikailang-org/henua).
 > and a cell-wrapped ergonomic client (`kohau.sqlite.client`,
 > `kohau.postgres.client`) whose ahu cell owns the connection
 > lifecycle and seals `Ffi` from callers. Both give request/reply
-> query execution with the FFI confined to one fiber. Postgres adds
-> opt-in reconnection. Connection pool, statement cache, and a
-> streaming multi-row protocol are follow-ups on both.
+> query execution with the FFI confined to one fiber. SQLite adds a
+> prepared-statement cache and chunked cursors; Postgres adds
+> opt-in reconnection. A connection pool is a follow-up on both, as
+> are the cache and cursors on the Postgres side.
 
 ## What ships
 
@@ -66,19 +67,27 @@ typed helpers:
   `Ok(Some(cols))`, `Ok(None)`, or `Err(msg)`.
 - `query_rows(c, sql, binds)` — multi-row query. Returns
   `Ok([[String]])` (every row's columns, possibly empty) or
-  `Err(msg)`. Column count is discovered from the statement, so
+  `Err(e)`. Column count is discovered from the statement, so
   `SELECT *` works without declaring a width.
 - `query_scalar(c, sql, binds)` — single-Int-column query
-  (COUNT, MAX). Returns `Ok(n)` or `Err(msg)`.
+  (COUNT, MAX). Returns `Ok(n)` or `Err(e)`.
 - `with_tx(c, body)` — transaction scope. `BEGIN` on entry,
   `COMMIT` if `body` returns `Ok`, `ROLLBACK` if it returns `Err`.
   The body's `Result` is threaded out; atomicity is all-or-nothing.
+  `with_tx_mode` picks the locking mode.
+- `fold_chunks(c, sql, binds, size, init, step)` — fold a result
+  set a chunk at a time, never holding more than one chunk. For
+  scans too large to materialise; `open_cursor` / `fetch_chunk` /
+  `close_cursor` sit underneath it.
+- `cache_stats(c)` — compiled-statement count and cache occupancy.
 - `close(c)` — tell the cell to close the connection and exit.
 
-Values are bound positionally via `[Bind]` (`BindText` / `BindInt`
-in v1) — the client never concatenates a value into SQL. The
-protocol is high-level on purpose: prepare / step / finalize stay
-inside the cell and never cross the mailbox. Spec:
+Values are bound positionally via `[Bind]` — text, integer, real,
+blob and NULL — and the client never concatenates a value into SQL.
+Failure is `SqliteError`, which keeps libsqlite3's result code apart
+from the message. The protocol is high-level on purpose: prepare /
+step / finalize stay inside the cell and never cross the mailbox,
+and a cursor is addressed by id for the same reason. Spec:
 `docs/design.md`. End-to-end smoke: `tests/client_roundtrip.kai`
 and `tests/client_errors.kai`.
 
@@ -229,31 +238,43 @@ The v0.1 goal was one driver working end-to-end — a kaikai program →
 kohau → libsqlite3 → file — so that henua's `SqliteRepository[A, I]`
 could be a thin adapter. That path is closed and covered by tier1.
 
-The driver shipped narrower than this section originally scoped it.
-Each cut below was taken deliberately, to reach a working end-to-end
-path sooner, and each is recorded at its site in
-`kohau/sqlite/client.kai`:
+Everything this section originally scoped is in, and the driver
+picked up more along the way:
 
-- **Type codecs are `Int` and `String` only.** `Real` / `Blob` /
-  NULL need a `Bind` variant and a matching bind op on the low-level
-  surface; deferred until a consumer needs them.
-- **No statement cache.** Every operation prepares and finalizes its
-  own statement. An LRU keyed by SQL text is the intended shape.
-- **No streaming row interface.** `query_rows` replies with a
-  complete `[[String]]`, not a stream. A chunked protocol (or an ahu
-  `Stream` source) is the follow-up.
-- **Transactions are `deferred` only.** `BEGIN IMMEDIATE` /
-  `EXCLUSIVE` land via a `with_tx_mode` variant when a consumer
-  needs them.
-- **No WAL default.** Journal mode is left at libsqlite3's default.
-- **Errors are `String`, not a typed `SqliteError`.** The libsqlite3
-  status codes are preserved on the low-level surface (`0` /
-  `100` / `101`), but the client surface flattens failure to a
-  message.
+- **Every storage class.** `Bind` covers text, integer, real, blob
+  and NULL. BLOBs cross the FFI boundary hex-encoded — kaikai's
+  `String` reaches C NUL-terminated, so raw bytes would truncate at
+  the first zero.
+- **WAL by default.** Connections open in WAL mode, so one writer
+  and many readers proceed concurrently. Advisory: a database that
+  cannot take it (`:memory:`, a filesystem without shared memory)
+  keeps its mode and works anyway.
+- **A prepared-statement cache.** Compiled statements are reused
+  across operations, keyed by SQL text — twenty identical inserts
+  compile one statement. `cache_stats` exposes the compile count, so
+  the optimisation is checkable rather than assumed.
+- **Transaction modes.** `with_tx` is the deferred default;
+  `with_tx_mode` issues `BEGIN IMMEDIATE` / `EXCLUSIVE` for the
+  read-then-write that would otherwise fail at the write.
+- **Cursors for large scans.** `fold_chunks` walks a result set a
+  bounded chunk at a time instead of materialising it, with
+  `open_cursor` / `fetch_chunk` / `close_cursor` underneath.
+- **Typed errors.** `SqliteError` keeps the result code (and the
+  extended code that says *which* constraint broke) apart from the
+  message, so callers branch on the code rather than on wording that
+  changes between releases.
 
 Beyond the original scope, v0.1 also gained typed `Db` / `Stmt`
 handles (v0.3.0) and the cell-wrapped client that seals `Ffi` from
 callers.
+
+What is still open:
+
+- **Rows arrive as text.** Every column is read through
+  `column_text`, so a BLOB needs `hex()` around it to come back
+  byte-exact. A typed row protocol would change the reply shape.
+- **No connection pool**, and no restart-on-failure — the Postgres
+  client has the first version of the latter.
 
 ## Postgres — libpq today, native wire protocol still the goal
 
