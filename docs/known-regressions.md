@@ -8,38 +8,51 @@ and whether it blocks tier1.
 This file follows ahu's convention: bugs found outside kohau's lane
 are documented here, not fixed inline. kohau does not patch kaikai.
 
-## kaikai 0.117.0
+## kaikai 0.118.0
 
-### `kai mutate` reports compiling mutants as `compile_failed`
+### `kai mutate` cannot compile mutants of the cell-wrapped clients
 
-**Symptom.** Mutants of `kohau/postgres/client.kai` are classified
-`compile_failed` even though the same source change compiles and runs.
-Applying the two `parse_digits` boundary mutants by hand
-(`c < '0'` -> `c <= '0'`, `c > '9'` -> `c >= '9'`) builds
-cleanly and fails `tier1-pg`, i.e. they are kills; `kai mutate` counts
-them as compile failures instead:
+**Symptom.** Every mutant of `kohau/sqlite/client.kai` and
+`kohau/postgres/client.kai` is reported `compile_failed`, whatever the
+operator:
 
 ```
- mutate --module kohau/postgres/client.kai --operator compare --json
-{"mutants": 6, "killed": 0, "compile_failed": 6, "survived": 0, ...}
+$ kai mutate --module kohau/sqlite/client.kai --operator literal --json
+{"mutants": 29, "killed": 0, "compile_failed": 29, "survived": 0, ...}
 ```
 
-The module needs the libpq shim through `CFLAGS`, which the fixtures
-pass via the Makefile but `kai mutate`'s internal compile step does
-not. Modules that link no shim (`kohau/sqlite.kai`) mutate normally,
-and a full sweep of this same module reported `0 did not compile`
-earlier, so the trigger is not yet pinned down.
+`kohau/sqlite.kai` and `kohau/postgres.kai` mutate normally. The two
+affected modules are exactly the ones that live in a subdirectory
+*and* import the `ahu` dependency; which of those two properties is
+the trigger is not established.
 
-**Impact.** A compile failure counts as a kill, so the affected
-mutants are silently treated as covered. Any mutation figure for the
-postgres modules is a floor, not a measurement.
+**A regression, not a standing limitation.** Full sweeps of both
+modules ran clean under 0.117.0 — 417 mutants of `sqlite/client.kai`
+(395 killed, 0 compile failures) and 171 of `postgres/client.kai`
+(152 killed, 0 compile failures). The same commit reproduces the
+failure under 0.118.0 in a clean worktree, so nothing in this repo
+caused it.
+
+Ruled out: the mutation operator, `--limit`, the oracle command, and
+dependency-cache state (`kai install` changes nothing). Neither
+documented escape hatch helps — declaring `[native]` in `kai.toml`
+does not make the mutant compile, and exporting the `CFLAGS` the
+Makefile uses does not either. `[native]` cannot express this
+package's shims anyway: `postgres_shim.c` needs libpq's include path,
+which `pg_config` discovers per machine, and the table is declarative
+with no build scripts.
+
+**Impact.** A compile failure is counted as a kill, so an affected
+module silently reports full coverage. Mutation figures for the two
+client modules are unusable while this stands; the figures recorded
+against 0.117.0 remain valid.
 
 **Workaround.** Verify individual mutants by editing the source and
-running the oracle by hand. Equivalent mutants are recorded in
-`tools/mutate-known-equivalent.txt`, which `kai mutate` does honour
-(`known_equivalent` is reported correctly).
+running the oracle by hand. Equivalent mutants go in
+`tools/mutate-known-equivalent.txt`, which is honoured correctly.
 
-**Blocks tier1.** No.
+**Blocks tier1.** No — `make tier1` and `make tier1-pg` pass on
+0.118.0 (16 fixtures).
 
 ## kaikai 0.98.0
 
