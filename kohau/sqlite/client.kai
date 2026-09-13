@@ -489,8 +489,8 @@ fn with_stmt(cache: StmtCache, db: Db, sql: String, binds: [Bind], k: (Stmt) -> 
 fn run_exec(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
   let rc_step = sqlite.step(stmt)
   let changed = sqlite.changes(db)
-  # SQLITE_DONE (101) is success for a no-row statement.
-  if rc_step == 101 {
+  # DONE, not OK, is success for a no-row statement.
+  if rc_step == sqlite.SQLITE_DONE {
     ExecOk(changed)
   } else {
     SqlErr(db_error(db, "step"))
@@ -505,11 +505,9 @@ fn run_query_row(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResul
   # column_count is valid after prepare, before the first step.
   let ncols = sqlite.column_count(stmt)
   let rc_step = sqlite.step(stmt)
-  # SQLITE_ROW (100): a row is available.
-  if rc_step == 100 {
+  if rc_step == sqlite.SQLITE_ROW {
     RowFound(read_text_cols(stmt, 0, ncols))
-  } else if rc_step == 101 {
-    # SQLITE_DONE: no rows.
+  } else if rc_step == sqlite.SQLITE_DONE {
     RowAbsent
   } else {
     SqlErr(db_error(db, "step"))
@@ -524,12 +522,11 @@ fn run_query_row(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResul
 # if a `step` returns anything other than ROW/DONE mid-iteration.
 fn collect_rows(db: Db, stmt: Stmt, ncols: Int, acc: [[String]]) : Result[[[String]], SqliteError] / Ffi {
   let rc = sqlite.step(stmt)
-  # SQLITE_ROW (100): a row is available; read it and recurse.
-  if rc == 100 {
+  if rc == sqlite.SQLITE_ROW {
     let row = read_text_cols(stmt, 0, ncols)
     collect_rows(db, stmt, ncols, [row, ...acc])
-  } else if rc == 101 {
-    # SQLITE_DONE: exhausted cleanly. acc is reverse order; flip it.
+  } else if rc == sqlite.SQLITE_DONE {
+    # Exhausted cleanly. acc is reverse order; flip it.
     Ok(reverse_rows(acc, []))
   } else {
     Err(db_error(db, "step"))
@@ -559,7 +556,7 @@ fn run_query_rows(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResu
 # Execute a single-Int-column statement (COUNT, MAX, scalar SELECT).
 fn run_query_scalar(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
   let rc_step = sqlite.step(stmt)
-  if rc_step == 100 {
+  if rc_step == sqlite.SQLITE_ROW {
     ScalarInt(sqlite.column_int(stmt, 0))
   } else {
     SqlErr(db_error(db, "step"))
@@ -600,10 +597,10 @@ fn fetch_rows(db: Db, cur: LiveCursor, budget: Int, acc: [[String]]) : Result[([
   Ok((reverse_rows(acc, []), false))
 } else {
   let rc = sqlite.step(cur.stmt)
-  if rc == 100 {
+  if rc == sqlite.SQLITE_ROW {
     let row = read_text_cols(cur.stmt, 0, cur.ncols)
     fetch_rows(db, cur, budget - 1, [row, ...acc])
-  } else if rc == 101 {
+  } else if rc == sqlite.SQLITE_DONE {
     Ok((reverse_rows(acc, []), true))
   } else {
     Err(db_error(db, "step"))
