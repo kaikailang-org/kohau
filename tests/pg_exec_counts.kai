@@ -1,0 +1,70 @@
+# tests/pg_exec_counts.kai — the affected-row count `exec` reports.
+#
+# `exec` returns the count libpq puts in `cmd_tuples`, parsed from
+# its text form. The parse is where the interesting boundaries are,
+# so the cases pick counts that sit on them:
+#
+#   1. A statement affecting no rows, and a DDL, whose `cmd_tuples`
+#      is empty rather than "0".
+#   2. Single digits at both ends of the digit range, 1 and 9.
+#   3. A two-digit count, so the accumulator has to carry.
+#   4. A count whose digits include '0' in a non-leading position
+#      (10, 90), which a parse that stops on '0' would truncate.
+#
+# Requires a server (see the Makefile's tier1-pg target); the
+# connection string arrives through PGHOST/PGDATABASE in the env.
+
+import actor
+
+import kohau.postgres.client
+
+fn run(c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] {
+  let _ = client.exec(c, sql, binds)
+  ()
+}
+
+fn show_exec(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.exec(c, sql, binds) {
+    Ok(n) -> Stdout.print(label ++ (": " ++ int_to_string(n)))
+    Err(msg) -> Stdout.print(label ++ (": err " ++ msg))
+  }
+
+# Fill `t` with `hi - lo + 1` rows numbered lo..hi.
+fn seed(c: Pid[PgMsg], lo: Int, hi: Int) : Unit / Actor[PgMsg] {
+  run(c, "DELETE FROM t", [])
+  run(c, "INSERT INTO t (id) SELECT generate_series($1::int, $2::int)",
+      [PgText(int_to_string(lo)), PgText(int_to_string(hi))])
+}
+
+fn body(c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console {
+  # A DDL reports no rows: `cmd_tuples` is empty, not "0".
+  show_exec("ddl", c, "CREATE TABLE t (id INT PRIMARY KEY)", [])
+
+  show_exec("one", c, "INSERT INTO t (id) VALUES ($1)", [PgText("1")])
+
+  # No row matches: "0", the one count that is a single zero.
+  show_exec("zero", c, "DELETE FROM t WHERE id = $1", [PgText("404")])
+
+  # 9 and 10 straddle the top of the digit range and the carry into
+  # a second digit.
+  seed(c, 1, 9)
+  show_exec("nine", c, "UPDATE t SET id = id + $1", [PgText("100")])
+
+  seed(c, 1, 10)
+  show_exec("ten", c, "UPDATE t SET id = id + $1", [PgText("100")])
+
+  # 90: two digits ending in zero, which a parse that bails on '0'
+  # would report as 9.
+  seed(c, 1, 90)
+  show_exec("ninety", c, "DELETE FROM t", [])
+
+  run(c, "DROP TABLE t", [])
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client("", body)
+  })
+  0
+}

@@ -8,6 +8,39 @@ and whether it blocks tier1.
 This file follows ahu's convention: bugs found outside kohau's lane
 are documented here, not fixed inline. kohau does not patch kaikai.
 
+## kaikai 0.117.0
+
+### `kai mutate` reports compiling mutants as `compile_failed`
+
+**Symptom.** Mutants of `kohau/postgres/client.kai` are classified
+`compile_failed` even though the same source change compiles and runs.
+Applying the two `parse_digits` boundary mutants by hand
+(`c < '0'` -> `c <= '0'`, `c > '9'` -> `c >= '9'`) builds
+cleanly and fails `tier1-pg`, i.e. they are kills; `kai mutate` counts
+them as compile failures instead:
+
+```
+ mutate --module kohau/postgres/client.kai --operator compare --json
+{"mutants": 6, "killed": 0, "compile_failed": 6, "survived": 0, ...}
+```
+
+The module needs the libpq shim through `CFLAGS`, which the fixtures
+pass via the Makefile but `kai mutate`'s internal compile step does
+not. Modules that link no shim (`kohau/sqlite.kai`) mutate normally,
+and a full sweep of this same module reported `0 did not compile`
+earlier, so the trigger is not yet pinned down.
+
+**Impact.** A compile failure counts as a kill, so the affected
+mutants are silently treated as covered. Any mutation figure for the
+postgres modules is a floor, not a measurement.
+
+**Workaround.** Verify individual mutants by editing the source and
+running the oracle by hand. Equivalent mutants are recorded in
+`tools/mutate-known-equivalent.txt`, which `kai mutate` does honour
+(`known_equivalent` is reported correctly).
+
+**Blocks tier1.** No.
+
 ## kaikai 0.98.0
 
 ### `extern "C" opaque` types cannot appear in `pub` signatures
