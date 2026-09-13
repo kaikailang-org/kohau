@@ -1,0 +1,6 @@
+# Mutants that mean exactly what the original means, and so can never
+# be killed. Keyed <file>:<line>:<operator>; the reason is mandatory.
+
+kohau/postgres/client.kai:173:compare  # parse_digits: `i >= len` vs `i > len` is the same function. At i == len the mutant falls through to char_at, which returns None for an out-of-range index, and the None arm yields the same acc the bounds check would have.
+
+kohau/postgres/client.kai:178:connect  # parse_digits: `or` -> `and` makes the non-digit guard unreachable, but its input is libpq's cmd_tuples, which is digits or empty by contract. No statement can produce a non-digit there, so both forms agree on every reachable input. Delete this entry if parse_count is ever called on arbitrary text.
