@@ -74,8 +74,6 @@
 #
 # Every `pub` is `#[unstable]` for the Hanga Roa edition.
 
-import spawn
-
 import actor
 
 import ahu.cell
