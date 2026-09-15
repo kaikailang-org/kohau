@@ -1,0 +1,141 @@
+# tests/pg_client_no_replay.kai — what a reconnect replays, and what
+# it refuses to.
+#
+# The rule under test: when a statement fails because the connection
+# dropped, its outcome is unknown — the server may have applied it and
+# died before acknowledging. So a query is re-run on the fresh
+# connection, and a write is NOT. Replaying an INSERT could duplicate
+# it.
+#
+# `pg_client_reconnect.kai` drops the connection by restarting the
+# server, which leaves it unreachable for a moment: the reconnect
+# fails outright and the replay decision is never reached. Here a
+# second connection terminates the first one's backend instead, so the
+# connection dies while the server stays up and the reconnect
+# succeeds. That is the only arrangement in which the decision is
+# observable.
+#
+# Cases:
+#   1. A write that met a dropped connection reports 08006 …
+#   2. … and left no row behind: it was not replayed. This is the
+#      assertion the SQLSTATE alone does not make — a client that
+#      replayed the write would report `ok` and show the row.
+#   3. A query that met a dropped connection IS re-run, and returns
+#      its row rather than an error.
+#
+# Requires a server (see the Makefile's tier1-pg target). Terminating
+# one's own backend needs no special privilege.
+
+import actor
+
+import kohau.postgres.client
+
+fn show_exec(label: String, c: Pid[PgMsg], sql: String, binds: [PgBind]) : Unit / Actor[PgMsg] + Console =
+  match client.exec(c, sql, binds) {
+    Ok(_) -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+fn show_query(label: String, c: Pid[PgMsg], sql: String) : Unit / Actor[PgMsg] + Console =
+  match client.query_row(c, sql, []) {
+    Ok(Some(cols)) -> Stdout.print(label ++ (": " ++ first(cols)))
+    Ok(None) -> Stdout.print(label ++ ": absent")
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+fn show_commit(label: String, c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console =
+  match client.commit(c) {
+    Ok(_) -> Stdout.print(label ++ ": ok")
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+fn show_rows(label: String, c: Pid[PgMsg], sql: String) : Unit / Actor[PgMsg] + Console =
+  match client.query_rows(c, sql, []) {
+    Ok(rows) -> Stdout.print(label ++ (": " ++ int_to_string(len_rows(rows))))
+    Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+  }
+
+fn len_rows(rows: [[String]]) : Int = match rows {
+  [] -> 0
+  [_, ...rest] -> 1 + len_rows(rest)
+}
+
+fn first(cols: [String]) : String = match cols {
+  [] -> "-"
+  [c, ..._] -> c
+}
+
+# The leading SQLSTATE of an error string, or "-" when it carries
+# none. Keeps the golden free of libpq's message wording.
+fn code_of(msg: String) : String =
+  if string_length(msg) >= 5 and is_code(string_slice(msg, 0, 5)) { string_slice(msg, 0, 5) } else { "-" }
+
+fn is_code(s: String) : Bool = all_alnum(s, 0)
+
+fn all_alnum(s: String, i: Int) : Bool = if i >= string_length(s) {
+  true
+} else {
+  match char_at(s, i) {
+    None -> false
+    Some(ch) -> if (ch >= '0' and ch <= '9') or (ch >= 'A' and ch <= 'Z') {
+      all_alnum(s, i + 1)
+    } else {
+      false
+    }
+  }
+}
+
+# Ask the connection under test for its backend pid.
+fn backend_pid(c: Pid[PgMsg]) : String / Actor[PgMsg] = match client.query_row(c, "SELECT pg_backend_pid()::text", []) {
+  Ok(Some(cols)) -> first(cols)
+  Ok(None) -> "-"
+  Err(_) -> "-"
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    # `killer` is an ordinary client; `c` is the one under test.
+    client.with_client("", killer => {
+      client.with_reconnecting_client("", c => {
+        let _ = client.exec(c, "DROP TABLE IF EXISTS w", [])
+        let _ = client.exec(c, "CREATE TABLE w (id INT PRIMARY KEY)", [])
+
+        # 1-2. Kill the backend, then write. The write meets a dead
+        #      connection, reconnects, and must not be replayed.
+        let pid = backend_pid(c)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid)])
+        show_exec("write_after_drop", c, "INSERT INTO w VALUES ($1)", [PgText("1")])
+        show_query("rows_after_drop", c, "SELECT count(*)::text FROM w")
+
+        # 3. A query that meets a dead connection is re-run instead.
+        let pid2 = backend_pid(c)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid2)])
+        show_query("query_after_drop", c, "SELECT 42::text")
+
+        # A multi-row query is re-run for the same reason.
+        let pid3 = backend_pid(c)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid3)])
+        show_rows("rows_query_after_drop", c, "SELECT * FROM generate_series(1, 3)")
+
+        # The reconnected connection is a working one.
+        show_exec("write_again", c, "INSERT INTO w VALUES ($1)", [PgText("2")])
+        show_query("rows_final", c, "SELECT count(*)::text FROM w")
+
+        # 4. A COMMIT is a write too. Re-run on a fresh connection it
+        #    would find no transaction open and succeed with a warning,
+        #    silently reporting a commit that never happened.
+        let _ = client.exec(c, "BEGIN", [])
+        let _ = client.exec(c, "INSERT INTO w VALUES ($1)", [PgText("3")])
+        let pid4 = backend_pid(c)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid4)])
+        show_commit("commit_after_drop", c)
+        show_query("rows_after_commit", c, "SELECT count(*)::text FROM w")
+
+        let _ = client.exec(c, "DROP TABLE w", [])
+        client.close(c)
+      })
+      client.close(killer)
+    })
+  })
+  0
+}

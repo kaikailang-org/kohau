@@ -1,0 +1,8 @@
+write_after_drop: err 08006
+rows_after_drop: 0
+query_after_drop: 42
+rows_query_after_drop: 3
+write_again: ok
+rows_final: 1
+commit_after_drop: err 08006
+rows_after_commit: 1
