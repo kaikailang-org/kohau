@@ -154,7 +154,7 @@ Requirements:
 
 - `kai` on `PATH`, version 0.91.0+ (git-dep resolution needs
   0.83.0+; the FFI v2 fixed-width boundary annotations the extern
-  declarations use need 0.91.0+). Verified against 0.111.0.
+  declarations use need 0.91.0+). Verified against 0.124.1.
 - libsqlite3 headers + library.
 - libpq 12+ headers + library, for the Postgres targets only.
 

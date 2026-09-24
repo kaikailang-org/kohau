@@ -51,8 +51,17 @@ against 0.117.0 remain valid.
 running the oracle by hand. Equivalent mutants go in
 `tools/mutate-known-equivalent.txt`, which is honoured correctly.
 
-**Blocks tier1.** No — `make tier1` and `make tier1-pg` pass on
-0.118.0 (16 fixtures).
+**Blocks tier1.** No — `make tier1` passes on 0.124.1 (10 fixtures);
+`make tier1-pg` needs a running Postgres.
+
+**Status.** Open. Filed upstream as
+[lnds/kaikai#2114](https://github.com/lnds/kaikai/issues/2114).
+Re-verified on kaikai 0.124.1, unchanged: 29/29 mutants of
+`sqlite/client.kai` and 20/20 of `postgres/client.kai` are
+`compile_failed`, while the control — `kohau/sqlite.kai`, a top-level
+module in the same package and working tree — reports 0 compile
+failures out of 10. The subdirectory-plus-git-dependency shape is
+still the discriminator.
 
 ## kaikai 0.98.0
 
