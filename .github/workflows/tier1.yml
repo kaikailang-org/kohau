@@ -150,7 +150,6 @@ jobs:
   # container and is not reachable from the job.
   tier1-pg-linux:
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 30
     services:
       postgres:
