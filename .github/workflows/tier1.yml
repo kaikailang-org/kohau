@@ -56,7 +56,7 @@ jobs:
 
       - name: Resolve dependencies (ahu git-dep)
         # ahu is a public repo, so this clone needs no credentials.
-        run: kai install
+        run: kai fetch
 
       - name: kohau tier0 (compile module + fixtures)
         run: make tier0
@@ -116,7 +116,7 @@ jobs:
           /opt/homebrew/opt/libpq/bin/createdb "$PGDATABASE"
 
       - name: Resolve dependencies (ahu git-dep)
-        run: kai install
+        run: kai fetch
 
       - name: kohau tier0-pg (compile the postgres module + fixtures)
         run: make tier0-pg
@@ -208,7 +208,7 @@ jobs:
           kai --version
 
       - name: Resolve dependencies (ahu git-dep)
-        run: kai install
+        run: kai fetch
 
       - name: kohau tier1 (sqlite)
         run: make tier1
