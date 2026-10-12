@@ -1,25 +1,17 @@
 name: tier1
 
-# Run kohau's tier1 fixtures on GitHub's standard hosted runner.
+# Run kohau's tier1 fixtures on GitHub's standard hosted runners.
 #
-# Runner: `macos-14` — a GitHub-hosted runner (free for public
-# repos), NOT self-hosted or private. macOS specifically because the
-# public kaikai toolchain only ships a `darwin-arm64` binary today;
-# there is no Linux release, so `ubuntu-latest` would have to build
-# the compiler from source. When kaikai publishes a Linux binary
-# this can move to `ubuntu-latest`.
-#
-# kaikai ships publicly from the `kaikailang-org` Homebrew tap, so
-# `kai` is installed the same way a developer installs it — no token,
-# no private clone, no building the compiler from source.
+# `kai` comes from the official installer, which resolves the current
+# release and verifies its sha256. Nothing is pinned on purpose: a
+# pinned version keeps passing against a compiler nobody runs any
+# more, so a release that breaks kohau surfaces here instead.
 #
 # Three jobs. `tier1` covers the sqlite surface, which needs nothing
 # but a library; `tier1-pg` covers postgres, which needs a live server
 # it provisions itself. They are separate so a postgres failure reads
-# as one, rather than turning the sqlite signal red.
-#
-# `tier1-pg-linux` is the second platform, and is non-blocking until
-# kaikai publishes a Linux binary — see the note above the job.
+# as one, rather than turning the sqlite signal red. `tier1-pg-linux`
+# is the second platform — see the note above that job.
 
 on:
   pull_request:
@@ -42,8 +34,14 @@ jobs:
       - name: Check out kohau
         uses: actions/checkout@v4
 
-      - name: Install kaikai (public Homebrew tap)
-        run: brew install kaikailang-org/kaikai/kaikai
+      - name: Install kaikai (official installer)
+        env:
+          # The installer resolves the release through the GitHub API,
+          # which allows 60 requests an hour unauthenticated.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/kaikailang-org/kaikai/main/install.sh | sh
+          echo "$HOME/.kaikai/bin" >> "$GITHUB_PATH"
 
       - name: Install libsqlite3
         run: brew install sqlite
@@ -89,8 +87,14 @@ jobs:
       - name: Check out kohau
         uses: actions/checkout@v4
 
-      - name: Install kaikai (public Homebrew tap)
-        run: brew install kaikailang-org/kaikai/kaikai
+      - name: Install kaikai (official installer)
+        env:
+          # The installer resolves the release through the GitHub API,
+          # which allows 60 requests an hour unauthenticated.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/kaikailang-org/kaikai/main/install.sh | sh
+          echo "$HOME/.kaikai/bin" >> "$GITHUB_PATH"
 
       - name: Install libpq and the postgres server
         run: brew install libpq postgresql@18
@@ -133,20 +137,10 @@ jobs:
         if: failure()
         run: tail -50 "$PGDATA_DIR/server.log" || true
 
-  # Linux coverage, non-blocking until kaikai ships a Linux binary.
-  #
-  # The toolchain is the only thing missing: as of v0.105.1 the
-  # release publishes `darwin-arm64` alone and the Homebrew formula
-  # carries just an `on_macos` block, so the install step below fails
-  # and `continue-on-error` keeps that from gating the merge queue.
-  # Everything after it is real and ready — the job stops being a
-  # placeholder the day a linux-x64 artefact exists, by deleting the
-  # `continue-on-error` line.
-  #
-  # Why it is worth carrying meanwhile: kohau's C shims are the part
-  # most likely to break on a second platform. `long` vs `int64_t`
-  # widths, header locations, and the default library search path all
-  # differ, and none of that is exercised by a macOS-only matrix.
+  # Linux coverage. kohau's C shims are the part most likely to break
+  # on a second platform: `long` vs `int64_t` widths, header
+  # locations, and the default library search path all differ, and
+  # none of that is exercised by a macOS-only matrix.
   #
   # Unlike the macOS job this one uses a service container — they are
   # Linux-only, which is exactly the platform here — so postgres is
@@ -190,13 +184,8 @@ jobs:
           sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
 
       - name: Install kaikai (official installer)
-        # The install command from kaikai-lang.org/get-started, run
-        # verbatim — the same one a developer runs. It is not
-        # platform-specific; the artefact is. install.sh refuses any
-        # non-Darwin host outright ("Only macOS (darwin-arm64) is
-        # supported in this iteration"), so this is the step that
-        # fails today, and the one that starts passing untouched when
-        # a Linux build ships.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/kaikailang-org/kaikai/main/install.sh | sh
           echo "$HOME/.kaikai/bin" >> "$GITHUB_PATH"
