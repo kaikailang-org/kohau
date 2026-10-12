@@ -11,13 +11,13 @@
 #      import `kohau.sqlite.client` can compile. `make` runs
 #      `kai fetch` automatically when kai.lock is absent or older
 #      than kai.toml.
-#   2. Link flags. The shim sources and `-lsqlite3` are passed to the
-#      `kai build` driver through `CFLAGS`, which the `kai` wrapper
-#      forwards to its underlying `cc`. We use `kai build` as the
-#      driver (not raw `kaic2`) because it owns stdlib prelude
-#      assembly, package-path resolution (so the `ahu` dep resolves),
-#      and edition gates. This mirrors henua's Makefile and the
-#      idiomatic `lnds/uira` raylib pattern.
+#   2. Link flags. The sqlite shim and `-lsqlite3` are declared in
+#      kai.toml's `[native]` table, so `kai build` compiles and links
+#      them with no flags from here. The postgres shim still goes
+#      through `CFLAGS`, which the `kai` wrapper forwards to its
+#      underlying `cc`. We use `kai build` as the driver (not raw
+#      `kaic2`) because it owns stdlib prelude assembly, package-path
+#      resolution (so the `ahu` dep resolves), and edition gates.
 #
 # Requirements on the host:
 #
@@ -37,15 +37,13 @@ KAI_BIN ?= kai
 # works on a Homebrew macOS box and a distro-packaged Linux one. Each
 # is `?=`, so an explicit `make PG_INC=... PG_LIB=...` still wins.
 #
-# macOS keeps both libraries keg-only under `/opt/homebrew/opt/`,
-# where the compiler does not look by default, so the paths must be
-# spelled out. On Linux they land in the default search path, and the
+# macOS keeps libpq keg-only under `/opt/homebrew/opt/`, where the
+# compiler does not look by default, so the paths must be spelled
+# out. On Linux it lands in the default search path, and the
 # empty-string case below means "pass no -I/-L at all" rather than a
-# bogus directory.
-
-# SQLite: pkg-config where available, Homebrew's keg otherwise.
-SQLITE_INC ?= $(shell pkg-config --variable=includedir sqlite3 2>/dev/null || echo /opt/homebrew/opt/sqlite/include)
-SQLITE_LIB ?= $(shell pkg-config --variable=libdir sqlite3 2>/dev/null || echo /opt/homebrew/opt/sqlite/lib)
+# bogus directory. SQLite needs none of this: the compiler builds
+# that shim through `[native]`, and libsqlite3 is in the default
+# search path on both platforms.
 
 # PostgreSQL: `pg_config` ships with libpq itself and is the
 # authoritative answer on both platforms; Homebrew's keg is the
@@ -54,31 +52,32 @@ PG_INC ?= $(shell pg_config --includedir 2>/dev/null || echo /opt/homebrew/opt/l
 PG_LIB ?= $(shell pg_config --libdir 2>/dev/null || echo /opt/homebrew/opt/libpq/lib)
 
 # Expand to nothing when the corresponding path came back empty.
-SQLITE_INC_FLAG = $(if $(SQLITE_INC),-isystem $(SQLITE_INC))
-SQLITE_LIB_FLAG = $(if $(SQLITE_LIB),-L$(SQLITE_LIB))
-PG_INC_FLAG     = $(if $(PG_INC),-isystem $(PG_INC))
-PG_LIB_FLAG     = $(if $(PG_LIB),-L$(PG_LIB))
+PG_INC_FLAG = $(if $(PG_INC),-isystem $(PG_INC))
+PG_LIB_FLAG = $(if $(PG_LIB),-L$(PG_LIB))
 
-# The shim ships inside this repo (unlike henua, which fetches it
-# from the kohau cache). `-include` brings the shim declarations
-# into the generated C; the shim source is appended so `cc` compiles
-# + links it in one step; `-lsqlite3` resolves the symbols it calls.
+# The sqlite shim is declared in kai.toml's `[native]` table, so the
+# compiler owns compiling and linking it and nothing about it belongs
+# on CFLAGS — passing it here as well would link two copies and fail
+# on duplicate symbols.
 SHIM_C := c/sqlite_shim.c
 SHIM_H := c/sqlite_shim.h
 
+# The postgres shim still rides CFLAGS. `[native]` compiles every
+# source it names for every consumer, and it has no way to name a
+# library directory, so a declared libpq shim would demand libpq of a
+# consumer that only wants sqlite and still fail to link on macOS,
+# where the keg is outside the default search path.
 PG_SHIM_C := c/postgres_shim.c
 PG_SHIM_H := c/postgres_shim.h
 
-# C11, not C99: the shim's hex scratch buffer is `_Thread_local`, a
-# C11 keyword. A kaikai fiber can resume on a different OS thread
-# than the one that parked it, so a shared static buffer would tear
-# under concurrent readers.
-KAI_CFLAGS = -std=c11 -O2 -Wno-unused-function -Wno-unused-variable \
-             $(SQLITE_INC_FLAG) -include $(SHIM_H) $(SHIM_C) \
-             $(SQLITE_LIB_FLAG) -lsqlite3
-
+# The shim is appended as its own translation unit and includes its
+# own header, rather than being force-included into the generated C.
+# `-include` would put a system header ahead of the kaikai runtime
+# header, which must define its feature-test macros before anything
+# else is parsed; on glibc that hides the POSIX declarations the
+# runtime needs and the build fails to compile.
 PG_CFLAGS = -std=c99 -O2 -Wno-unused-function -Wno-unused-variable \
-            $(PG_INC_FLAG) -include $(PG_SHIM_H) $(PG_SHIM_C) \
+            $(PG_INC_FLAG) $(PG_SHIM_C) \
             $(PG_LIB_FLAG) -lpq
 
 BUILD = build
@@ -177,16 +176,16 @@ tier1-pg-reconnect: $(PG_RESTART_BIN)
 	diff -u "$$exp" "$$out" || { echo "tier1-pg-reconnect: FAIL"; exit 1; }; \
 	echo "tier1-pg-reconnect: $(PG_RESTART_NAME) OK"
 
-# Per-fixture build. `kai build` is the driver; the shim sources and
-# the library go through CFLAGS. Depends on kai.lock so a missing or
-# stale lockfile triggers an install first. The `pg_%` rule is more
-# specific than the catch-all below, so make prefers it for the
-# postgres fixtures — they link libpq instead of libsqlite3.
+# Per-fixture build. `kai build` is the driver. Depends on kai.lock so
+# a missing or stale lockfile triggers a fetch first. The `pg_%` rule
+# is more specific than the catch-all below, so make prefers it for
+# the postgres fixtures — they link libpq through CFLAGS, while the
+# sqlite ones need no flags at all.
 $(BUILD)/pg_%: tests/pg_%.kai $(KOHAU_SRC) $(PG_SHIM_C) $(PG_SHIM_H) kai.toml kai.lock | $(BUILD)
 	CFLAGS="$(PG_CFLAGS)" $(KAI_BIN) build $< -o $@
 
 $(BUILD)/%: tests/%.kai $(KOHAU_SRC) $(SHIM_C) $(SHIM_H) kai.toml kai.lock | $(BUILD)
-	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build $< -o $@
+	$(KAI_BIN) build $< -o $@
 
 # kai.lock — produced by `kai fetch`. Treat it as a build input so
 # fixtures rebuild after a dependency change and a fetch runs when

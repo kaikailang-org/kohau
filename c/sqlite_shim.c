@@ -25,6 +25,8 @@
 // link time. The kaikai side declares them with `extern "C" fn
 // kai_sqlite_*` and the generated code resolves them unchanged.
 
+#include "sqlite_shim.h"
+
 #include <sqlite3.h>
 #include <stddef.h>
 #include <stdint.h>

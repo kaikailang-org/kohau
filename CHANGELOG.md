@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ### Added
 
+- **The sqlite shim ships with the package.** `kai.toml` declares a
+  `[native]` table for `c/sqlite_shim.c`, so a consumer that imports
+  `kohau.sqlite` gets the shim compiled and linked by plain `kai
+  build` and needs no flags of its own. The postgres shim stays on
+  `CFLAGS`: `[native]` compiles every source it names for every
+  consumer and cannot name a library directory, so declaring libpq
+  there would demand it of sqlite-only consumers and still fail to
+  link where the keg is outside the default search path.
+
 - **`kohau.postgres` — low-level PostgreSQL client.** Mirrors
   `kohau.sqlite`'s shape (typed `Conn` / `Res` handles,
   `Option`-returning constructors) over libpq, bridged by
@@ -113,6 +122,14 @@ project adheres to [Semantic Versioning](https://semver.org/) once
   on a second platform.
 
 ### Fixed
+
+- **A build on glibc no longer fails to compile the runtime.** The
+  shims were force-included into the generated C with `-include`,
+  which put a system header ahead of the kaikai runtime header. That
+  header must define its feature-test macros before anything else is
+  parsed, and on glibc the ordering hid `Dl_info`, `CLOCK_MONOTONIC`
+  and `struct addrinfo` from the runtime. Each shim now includes its
+  own header and is compiled as its own translation unit.
 
 - **The `[unstable]` keys are spelled as module paths.** An
   acknowledgement key is the declaration's mangled module path with the
