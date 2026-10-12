@@ -9,7 +9,7 @@
 #   1. Dependency resolution. The `ahu` dep must be fetched into the
 #      user-level cache and pinned in kai.lock before fixtures that
 #      import `kohau.sqlite.client` can compile. `make` runs
-#      `kai install` automatically when kai.lock is absent or older
+#      `kai fetch` automatically when kai.lock is absent or older
 #      than kai.toml.
 #   2. Link flags. The shim sources and `-lsqlite3` are passed to the
 #      `kai build` driver through `CFLAGS`, which the `kai` wrapper
@@ -54,9 +54,9 @@ PG_INC ?= $(shell pg_config --includedir 2>/dev/null || echo /opt/homebrew/opt/l
 PG_LIB ?= $(shell pg_config --libdir 2>/dev/null || echo /opt/homebrew/opt/libpq/lib)
 
 # Expand to nothing when the corresponding path came back empty.
-SQLITE_INC_FLAG = $(if $(SQLITE_INC),-I$(SQLITE_INC))
+SQLITE_INC_FLAG = $(if $(SQLITE_INC),-isystem $(SQLITE_INC))
 SQLITE_LIB_FLAG = $(if $(SQLITE_LIB),-L$(SQLITE_LIB))
-PG_INC_FLAG     = $(if $(PG_INC),-I$(PG_INC))
+PG_INC_FLAG     = $(if $(PG_INC),-isystem $(PG_INC))
 PG_LIB_FLAG     = $(if $(PG_LIB),-L$(PG_LIB))
 
 # The shim ships inside this repo (unlike henua, which fetches it
@@ -188,11 +188,11 @@ $(BUILD)/pg_%: tests/pg_%.kai $(KOHAU_SRC) $(PG_SHIM_C) $(PG_SHIM_H) kai.toml ka
 $(BUILD)/%: tests/%.kai $(KOHAU_SRC) $(SHIM_C) $(SHIM_H) kai.toml kai.lock | $(BUILD)
 	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build $< -o $@
 
-# kai.lock — produced by `kai install`. Treat it as a build input so
-# fixtures rebuild after a dependency change and an install runs when
+# kai.lock — produced by `kai fetch`. Treat it as a build input so
+# fixtures rebuild after a dependency change and a fetch runs when
 # the lockfile is absent or older than kai.toml.
 kai.lock: kai.toml
-	$(KAI_BIN) install
+	$(KAI_BIN) fetch
 
 $(BUILD):
 	mkdir -p $(BUILD)
