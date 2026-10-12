@@ -93,6 +93,16 @@ project adheres to [Semantic Versioning](https://semver.org/) once
 
 ### Changed
 
+- **The library headers are included as system headers.** `pkg-config`
+  answers with the SDK include directory on macOS, and `-I` strips a
+  directory's system-header status, which exposed every header it
+  reaches to checks meant for this package's own code — a cold build
+  emitted 2390 warnings, none of them about kohau. `-isystem` restores
+  that status with no check disabled.
+
+- **Dependencies are resolved with `kai fetch`.** The no-argument
+  `kai install` is deprecated and changes meaning at the next edition.
+
 - **The Makefile discovers library paths instead of assuming them.**
   `SQLITE_INC` / `PG_INC` and their `_LIB` counterparts now come from
   `pkg-config` and `pg_config`, falling back to Homebrew's kegs, and
@@ -103,6 +113,12 @@ project adheres to [Semantic Versioning](https://semver.org/) once
   on a second platform.
 
 ### Fixed
+
+- **The `[unstable]` keys are spelled as module paths.** An
+  acknowledgement key is the declaration's mangled module path with the
+  package name on the front — `kohau__sqlite`, `kohau__sqlite__client`
+  — so the bare `sqlite` the manifest carried matched nothing and
+  silenced nothing.
 
 - **`kai.toml` declares `edition = "hanga-roa"`.** 0.4.0 declared
   `orongo`, which is not a released edition — hanga-roa is the
