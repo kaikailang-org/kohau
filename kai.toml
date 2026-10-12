@@ -13,14 +13,15 @@ edition = "hanga-roa"
 # ergonomic surface is a cell, not raw kaikai primitives.
 ahu = { source = "github.com/kaikailang-org/ahu", ref = "v0.2.1" }
 
-# kohau's own tier1 fixtures import kohau's #[unstable] decls
-# (sqlite.* low-level, client.* cell-wrapped) plus ahu's cell.*
-# (cell.ask is #[unstable]). Opting in here acknowledges the
-# disclosure for the in-tree fixtures so the build is warning-free.
-# Downstream consumers do the same in their own kai.toml.
+# kohau's own fixtures import kohau's #[unstable] declarations: the
+# low-level sqlite and postgres bindings, and the cell-wrapped client
+# over each. A key is the declaration's module path mangled the way
+# the compiler reports it, package name included, so an entry
+# silences only the module it names — a bare `sqlite` matches nothing.
+# Acknowledging the disclosure here keeps the in-tree build
+# warning-free; downstream consumers do the same in their own kai.toml.
 [unstable]
-kohau = true
-sqlite = true
-postgres = true
-client = true
-cell = true
+kohau__sqlite = true
+kohau__sqlite__client = true
+kohau__postgres = true
+kohau__postgres__client = true
