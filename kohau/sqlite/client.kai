@@ -133,7 +133,6 @@
 # (`with_client`, `exec`, `query_row`, `query_scalar`) may reshape
 # as the restart story and the multi-row protocol land.
 
-import spawn
 
 import actor
 
