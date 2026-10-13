@@ -5,7 +5,7 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
-## [Unreleased]
+## [0.5.0] — 2026-10-12
 
 ### Added
 
