@@ -27,6 +27,8 @@
 // push/exec sequence must complete before the next begins on the same
 // connection. kohau's cell owns the connection, which serialises access.
 
+#include "postgres_shim.h"
+
 #include <libpq-fe.h>
 #include <stddef.h>
 #include <stdint.h>
