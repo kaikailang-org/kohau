@@ -1,0 +1,8 @@
+journal mode: wal
+bind failure: err code=25
+first cursor id: 1
+scan failure: err code=1
+drained: end
+closed early: more
+left open: more
+connection closed: yes

@@ -1,0 +1,146 @@
+# tests/client_teardown.kai — the cell leaves nothing open behind it.
+#
+# libsqlite3 refuses to close a connection that still has a live
+# statement, and the cell discards that refusal on `Shutdown`: a
+# statement the cell lost track of without finalizing leaves the whole
+# connection open, silently. This fixture drives every path on which
+# the cell drops a statement, shuts down, and then checks from outside
+# that the connection really closed.
+#
+# Paths exercised before shutdown:
+#   1. the statement cache evicting past capacity
+#   2. a cursor whose binds fail at open
+#   3. a cursor that fails mid-scan
+#   4. a cursor read to its end
+#   5. a cursor closed early
+#   6. a cursor still open at shutdown, and a non-empty cache
+#
+# The check: a database in WAL mode cannot leave it while any other
+# connection holds it open, so a fresh connection switching the file
+# to `delete` succeeds only once the cell's connection is gone.
+# Shutdown is fire-and-forget, so the check polls.
+#
+# The database is a file under build/ (WAL does not apply to
+# `:memory:`), recreated by the fixture on every run.
+
+import actor
+
+import time
+
+import kohau.sqlite
+
+import kohau.sqlite.client
+
+fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ (": " ++ s))
+
+fn render_err(r: Result[Cursor, SqliteError]) : String = match r {
+  Ok(_) -> "unexpectedly ok"
+  Err(e) -> "err code=" ++ int_to_string(e.code)
+}
+
+fn render_chunk(r: Result[([[String]], Bool), SqliteError]) : String = match r {
+  Ok((_, done)) -> if done { "end" } else { "more" }
+  Err(e) -> "err code=" ++ int_to_string(e.code)
+}
+
+# Run `n` distinct statements, enough to push the cache past capacity.
+fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+  ()
+} else {
+  let _ = client.query_scalar(c, "SELECT " ++ int_to_string(i), [])
+  distinct_n(c, i + 1, n)
+}
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  match client.query_row(c, "PRAGMA journal_mode", []) {
+    Ok(Some(cols)) -> show("journal mode", join(cols))
+    Ok(None) -> show("journal mode", "absent")
+    Err(e) -> show("journal mode", "err code=" ++ int_to_string(e.code))
+  }
+  let _ = client.exec(c, "DROP TABLE IF EXISTS nums", [])
+  let _ = client.exec(c, "CREATE TABLE nums (n INTEGER PRIMARY KEY)", [])
+  let _ = client.exec(c, "INSERT INTO nums (n) VALUES (1), (2), (3)", [])
+
+  # ---- 1. eviction ----
+  distinct_n(c, 1, 20)
+
+  # ---- 2. binds rejected at open ----
+  # Two values for one placeholder: SQLITE_RANGE (25).
+  show("bind failure", render_err(client.open_cursor(c, "SELECT ?", [BindInt(1), BindInt(2)])))
+
+  # ---- 3. a failure mid-scan ----
+  # abs() of the smallest Int overflows, at step rather than prepare.
+  match client.open_cursor(c, "SELECT abs(-9223372036854775807 - n) FROM nums", []) {
+    Err(e) -> show("scan failure", "open err code=" ++ int_to_string(e.code))
+    Ok(cur) -> {
+      # Ids count up from 1; the failed open above consumed none.
+      show("first cursor id", int_to_string(cur.id))
+      show("scan failure", render_chunk(client.fetch_chunk(c, cur, 10)))
+    }
+  }
+
+  # ---- 4. read to the end ----
+  match client.open_cursor(c, "SELECT n FROM nums ORDER BY n", []) {
+    Err(e) -> show("drained", "open err code=" ++ int_to_string(e.code))
+    Ok(cur) -> show("drained", render_chunk(client.fetch_chunk(c, cur, 10)))
+  }
+
+  # ---- 5. closed early ----
+  match client.open_cursor(c, "SELECT n FROM nums ORDER BY n", []) {
+    Err(e) -> show("closed early", "open err code=" ++ int_to_string(e.code))
+    Ok(cur) -> {
+      show("closed early", render_chunk(client.fetch_chunk(c, cur, 1)))
+      client.close_cursor(c, cur)
+    }
+  }
+
+  # ---- 6. still open at shutdown ----
+  match client.open_cursor(c, "SELECT n FROM nums ORDER BY n", []) {
+    Err(e) -> show("left open", "open err code=" ++ int_to_string(e.code))
+    Ok(cur) -> show("left open", render_chunk(client.fetch_chunk(c, cur, 1)))
+  }
+
+  client.close(c)
+}
+
+fn join(xs: [String]) : String = match xs {
+  [] -> ""
+  [x] -> x
+  [x, ...rest] -> x ++ ("|" ++ join(rest))
+}
+
+# True when a fresh connection can take the file out of WAL, which
+# needs every other connection to it closed.
+fn released(path: String) : Bool / Ffi = match sqlite.open(path) {
+  None -> false
+  Some(db) -> {
+    let mode = match sqlite.prepare(db, "PRAGMA journal_mode = DELETE") {
+      None -> ""
+      Some(stmt) -> {
+        let m = if sqlite.step(stmt) == sqlite.SQLITE_ROW { sqlite.column_text(stmt, 0) } else { "" }
+        let _ = sqlite.finalize(stmt)
+        m
+      }
+    }
+    let _ = sqlite.close(db)
+    mode == "delete"
+  }
+}
+
+fn wait_released(path: String, tries: Int) : Bool / Ffi + Clock = if released(path) {
+  true
+} else if tries <= 0 {
+  false
+} else {
+  sleep(millis(10))
+  wait_released(path, tries - 1)
+}
+
+fn main() : Int / Spawn + Ffi + Console + Clock {
+  let path = "build/client_teardown.db"
+  with_mailbox(() => {
+    client.with_client(path, body)
+  })
+  show("connection closed", if wait_released(path, 300) { "yes" } else { "no" })
+  0
+}
