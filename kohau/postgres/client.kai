@@ -50,8 +50,10 @@
 # `PgErr(sqlstate, message)` keeps the five-character SQLSTATE
 # separate from the message text. Branch on the code — it is stable
 # across server versions and locales; the message is neither. The
-# code is empty for failures that never reached the server (a dead
-# connection, an unallocatable result).
+# code is empty only when there is no usable connection (it dropped,
+# or never opened); a failure the cell raises on a live connection
+# carries a code of its own — 21000 for a `query_row` that matched
+# several rows, 54000 for a statement that could not be sent.
 #
 # ## v1 limitations
 #
@@ -186,9 +188,20 @@ fn parse_digits(s: String, i: Int, acc: Int) : Int =
 # Run a statement and hand the result to `k`, clearing it either way.
 # Every exec path funnels through here so no `Res` can leak: the
 # clear happens before the reply value escapes.
+#
+# No result at all has two causes. On a dead connection it is the
+# connection's failure and keeps an empty SQLSTATE (see
+# `lost_connection`). On a live one the statement was never sent — a
+# bind list past the shim's ceiling, or no memory for the result — so
+# it carries 54000 (program_limit_exceeded): reconnecting would not
+# help, and would discard an open transaction.
 fn with_result(c: Conn, sql: String, binds: [PgBind], k: (Res) -> PgReply / Ffi) : PgReply / Ffi =
   match postgres.exec(c, sql, to_binds(binds)) {
-    None -> PgErr("", "exec failed: " ++ postgres.error_message(c))
+    None -> if postgres.status(c) == CONNECTION_OK {
+      PgErr("54000", "exec failed: statement not sent")
+    } else {
+      PgErr("", "exec failed: " ++ postgres.error_message(c))
+    }
     Some(r) -> {
       let reply = if postgres.result_ok(r) { k(r) } else { result_err(r) }
       let _ = postgres.clear(r)
@@ -214,7 +227,10 @@ fn run_exec(c: Conn, sql: String, binds: [PgBind], commit: Bool) : PgReply / Ffi
 
 # Execute a ≤1-row query. More than one row is a caller error, not a
 # silent truncation: a query declared to return at most one row that
-# returns several means the predicate is wrong.
+# returns several means the predicate is wrong. It carries 21000
+# (cardinality_violation), the code the server itself uses for a
+# subquery returning too many rows, so it is never mistaken for a
+# dropped connection.
 fn run_query_row(c: Conn, sql: String, binds: [PgBind]) : PgReply / Ffi =
   with_result(c, sql, binds, r => {
     let nr = postgres.ntuples(r)
@@ -223,7 +239,7 @@ fn run_query_row(c: Conn, sql: String, binds: [PgBind]) : PgReply / Ffi =
     } else if nr == 1 {
       PgRowFound(read_cols(r, 0, 0, postgres.nfields(r)))
     } else {
-      PgErr("", "query_row: statement returned " ++ (int_to_string(nr) ++ " rows"))
+      PgErr("21000", "query_row: statement returned " ++ (int_to_string(nr) ++ " rows"))
     }
   })
 
@@ -271,7 +287,9 @@ fn close_conn(c: Option[Conn]) : Int / Ffi = match c {
 # the server is what produced the error. A statement that died with
 # the connection has no code at all: there was no server left to
 # assign one. So an empty SQLSTATE on a failure means the failure was
-# ours, not the statement's.
+# ours, not the statement's. The failures the cell raises itself on a
+# live connection (too many rows for `query_row`, a statement never
+# sent) carry codes of their own to keep that inference sound.
 #
 # Measured on a server killed mid-session: the discovering statement
 # reports a failed result, an empty SQLSTATE, and a status still

@@ -1,0 +1,125 @@
+# tests/pg_client_session.kai — when a client keeps its session, and
+# when it gives it up.
+#
+# A reconnecting client opens a fresh connection when the old one
+# drops, and a fresh connection is a fresh session: no open
+# transaction, a new backend. So the decision to reconnect has to be
+# right in both directions — never on a request that succeeded or
+# that the cell itself refused, and never at all for a plain client.
+#
+# Cases:
+#   1. A reconnecting client stays on one backend across a hit, a
+#      miss and a multi-row query.
+#   2. A query_row matching several rows fails with 21000, and a bind
+#      list too long to send fails with 54000 — and neither costs the
+#      session: the open transaction survives and commits.
+#   3. A ROLLBACK sent through plain `exec` reports success. Only
+#      `commit` inspects the command tag.
+#   4. A plain client whose backend is terminated does not reconnect:
+#      the failure surfaces, and every request after it reports that
+#      the statement could not be executed.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import actor
+
+import kohau.postgres.client
+
+fn first(cols: [String]) : String = match cols {
+  [] -> "-"
+  [c, ..._] -> c
+}
+
+# The leading SQLSTATE of an error string, or "-" when it carries
+# none. Keeps the golden free of libpq's message wording.
+fn code_of(msg: String) : String =
+  if string_length(msg) >= 5 and all_alnum(string_slice(msg, 0, 5), 0) { string_slice(msg, 0, 5) } else { "-" }
+
+fn all_alnum(s: String, i: Int) : Bool = if i >= string_length(s) {
+  true
+} else {
+  match char_at(s, i) {
+    None -> false
+    Some(ch) -> if (ch >= '0' and ch <= '9') or (ch >= 'A' and ch <= 'Z') {
+      all_alnum(s, i + 1)
+    } else {
+      false
+    }
+  }
+}
+
+fn backend_pid(c: Pid[PgMsg]) : String / Actor[PgMsg] = match client.query_row(c, "SELECT pg_backend_pid()::text", []) {
+  Ok(Some(cols)) -> first(cols)
+  Ok(None) -> "absent"
+  Err(_) -> "err"
+}
+
+fn show_same(label: String, c: Pid[PgMsg], pid: String) : Unit / Actor[PgMsg] + Console =
+  Stdout.print(label ++ (if backend_pid(c) == pid { ": same backend" } else { ": new backend" }))
+
+fn show_exec(label: String, r: Result[Int, String]) : Unit / Console = match r {
+  Ok(_) -> Stdout.print(label ++ ": ok")
+  Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+}
+
+fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+  Ok(Some(cols)) -> Stdout.print(label ++ (": " ++ first(cols)))
+  Ok(None) -> Stdout.print(label ++ ": absent")
+  Err(msg) -> Stdout.print(label ++ (": err " ++ code_of(msg)))
+}
+
+# `n` text binds, one more than the shim will carry when `n` is 129.
+fn binds(n: Int) : [PgBind] = if n <= 0 { [] } else { [PgText("x"), ...binds(n - 1)] }
+
+fn session(c: Pid[PgMsg]) : Unit / Actor[PgMsg] + Console {
+  # ---- 1. success never reconnects ----
+  let pid = backend_pid(c)
+  show_same("after a hit", c, pid)
+  let _ = client.query_row(c, "SELECT 1 WHERE false", [])
+  show_same("after a miss", c, pid)
+  let _ = client.query_rows(c, "SELECT * FROM generate_series(1, 3)", [])
+  show_same("after a multi-row query", c, pid)
+
+  # ---- 2. the cell's own refusals keep the session ----
+  let _ = client.exec(c, "DROP TABLE IF EXISTS sess", [])
+  let _ = client.exec(c, "CREATE TABLE sess (id INT)", [])
+  let tx = client.with_tx(c, t => {
+    let _ = client.exec(t, "INSERT INTO sess VALUES (1)", [])
+    show_row("too many rows", client.query_row(t, "SELECT * FROM generate_series(1, 2)", []))
+    show_exec("too many binds", client.exec(t, "SELECT 1", binds(129)))
+    client.exec(t, "INSERT INTO sess VALUES (2)", [])
+  })
+  show_exec("transaction", tx)
+  show_same("after the refusals", c, pid)
+  show_row("rows committed", client.query_row(c, "SELECT count(*)::text FROM sess", []))
+  let _ = client.exec(c, "DROP TABLE sess", [])
+
+  # ---- 3. exec does not inspect the tag ----
+  let _ = client.exec(c, "BEGIN", [])
+  show_exec("rollback via exec", client.exec(c, "ROLLBACK", []))
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client("", killer => {
+      client.with_reconnecting_client("", c => {
+        session(c)
+        client.close(c)
+      })
+
+      # ---- 4. a plain client does not reconnect ----
+      client.with_client("", p => {
+        let pid = backend_pid(p)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid)])
+        show_row("plain client after drop", client.query_row(p, "SELECT 42::text", []))
+        match client.query_row(p, "SELECT 42::text", []) {
+          Ok(_) -> Stdout.print("plain client next request: ok")
+          Err(msg) -> Stdout.print("plain client next request: " ++ (if string_length(msg) >= 11 and string_slice(msg, 0, 11) == "exec failed" { "not executed" } else { "other failure" }))
+        }
+        client.close(p)
+      })
+      client.close(killer)
+    })
+  })
+  0
+}

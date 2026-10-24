@@ -1,0 +1,11 @@
+after a hit: same backend
+after a miss: same backend
+after a multi-row query: same backend
+too many rows: err 21000
+too many binds: err 54000
+transaction: ok
+after the refusals: same backend
+rows committed: 2
+rollback via exec: ok
+plain client after drop: err -
+plain client next request: not executed
