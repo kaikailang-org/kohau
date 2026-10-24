@@ -1,0 +1,171 @@
+# tests/pg_client_release.kai — the cell gives back every connection
+# it stops using.
+#
+# A connection the cell forgets to `finish` is invisible while
+# resources are plentiful. So this fixture first takes every
+# connection slot the shim has, then hands back only as many as the
+# case needs: a slot the cell fails to release shows up as the next
+# connect failing.
+#
+# Cases:
+#   1. A connect that fails is finished, so its slot serves the next
+#      client.
+#   2. `close` finishes the connection (asynchronously: the check
+#      polls).
+#   3. A reconnect finishes the dropped connection before opening the
+#      new one, so it succeeds with no spare slot.
+#   4. A reconnecting client that started without a connection gets
+#      one as soon as a slot frees up.
+#
+# The filler connections name a socket directory that does not
+# exist, so they fail at once without reaching a server; a failed
+# connection still holds its slot until `finish`. The number of slots
+# is never printed.
+#
+# Requires a server (see the Makefile's tier1-pg target).
+
+import actor
+
+import time
+
+import kohau.postgres
+
+import kohau.postgres.client
+
+const NOWHERE : String = "host=/nonexistent/kohau-pg-release"
+
+# Far above the shim's bound; a guard against a `connect` that never
+# reports exhaustion.
+const FILL_CAP : Int = 1000
+
+# Poll budget for releases that happen on a cell's own schedule.
+const TRIES : Int = 300
+
+fn first(cols: [String]) : String = match cols {
+  [] -> "-"
+  [c, ..._] -> c
+}
+
+fn show_row(label: String, r: Result[Option[[String]], String]) : Unit / Console = match r {
+  Ok(Some(cols)) -> Stdout.print(label ++ (": " ++ first(cols)))
+  Ok(None) -> Stdout.print(label ++ ": absent")
+  Err(_) -> Stdout.print(label ++ ": err")
+}
+
+fn show_yes(label: String, ok: Bool) : Unit / Console = Stdout.print(label ++ (if ok { ": yes" } else { ": no" }))
+
+# Take every free slot, adding the handles to `acc`.
+fn fill(acc: [Conn], n: Int) : [Conn] / Ffi = if n >= FILL_CAP {
+  acc
+} else {
+  match postgres.connect(NOWHERE) {
+    None -> acc
+    Some(c) -> fill([c, ...acc], n + 1)
+  }
+}
+
+# Finish the first `k` handles, returning the rest.
+fn release(cs: [Conn], k: Int) : [Conn] / Ffi = if k <= 0 {
+  cs
+} else {
+  match cs {
+    [] -> []
+    [c, ...rest] -> {
+      let _ = postgres.finish(c)
+      release(rest, k - 1)
+    }
+  }
+}
+
+fn finish_all(cs: [Conn]) : Unit / Ffi = match cs {
+  [] -> ()
+  [c, ...rest] -> {
+    let _ = postgres.finish(c)
+    finish_all(rest)
+  }
+}
+
+fn count(cs: [Conn]) : Int = match cs {
+  [] -> 0
+  [_, ...rest] -> 1 + count(rest)
+}
+
+# Wait until `n` slots are free at once, leaving them free.
+fn wait_free(n: Int, tries: Int) : Bool / Ffi + Clock {
+  let got = fill([], FILL_CAP - n)
+  let enough = count(got) >= n
+  finish_all(got)
+  if enough {
+    true
+  } else if tries <= 0 {
+    false
+  } else {
+    sleep(millis(10))
+    wait_free(n, tries - 1)
+  }
+}
+
+fn backend_pid(c: Pid[PgMsg]) : String / Actor[PgMsg] = match client.query_row(c, "SELECT pg_backend_pid()::text", []) {
+  Ok(Some(cols)) -> first(cols)
+  Ok(None) -> "absent"
+  Err(_) -> "err"
+}
+
+# Ask until the client answers, sleeping between attempts.
+fn poll_answer(c: Pid[PgMsg], tries: Int) : Bool / Actor[PgMsg] + Clock = match client.query_row(c, "SELECT 1", []) {
+  Ok(_) -> true
+  Err(_) -> if tries <= 0 {
+    false
+  } else {
+    sleep(millis(10))
+    poll_answer(c, tries - 1)
+  }
+}
+
+fn main() : Int / Spawn + Ffi + Console + Clock {
+  let held = release(fill([], 0), 1)
+
+  # ---- 1. a failed connect is finished ----
+  with_mailbox(() => {
+    client.with_client(NOWHERE, bad => client.close(bad))
+    client.with_client("", good => {
+      show_row("connect after a failed one", client.query_row(good, "SELECT 42::text", []))
+      client.close(good)
+    })
+  })
+
+  # ---- 2. close finishes the connection ----
+  show_yes("close frees the slot", wait_free(1, TRIES))
+
+  # ---- 3. a reconnect finishes the dead connection first ----
+  let held3 = release(held, 1)
+  with_mailbox(() => {
+    client.with_client("", killer => {
+      client.with_reconnecting_client("", c => {
+        let pid = backend_pid(c)
+        let _ = client.exec(killer, "SELECT pg_terminate_backend($1::int)", [PgText(pid)])
+        show_row("reconnect with no spare slot", client.query_row(c, "SELECT 42::text", []))
+        client.close(c)
+      })
+      client.close(killer)
+    })
+  })
+
+  # ---- 4. a client that started with no connection gets one ----
+  let settled = wait_free(2, TRIES)
+  let held4 = release(fill(held3, 0), 1)
+  with_mailbox(() => {
+    client.with_client("", admin => {
+      client.with_reconnecting_client("", r => {
+        show_row("reconnecting client with no slot", client.query_row(r, "SELECT 42::text", []))
+        client.close(admin)
+        show_yes("reconnecting client recovers", settled and poll_answer(r, TRIES))
+        client.close(r)
+      })
+    })
+  })
+
+  let _ = wait_free(1, TRIES)
+  finish_all(held4)
+  0
+}

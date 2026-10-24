@@ -1,0 +1,5 @@
+connect after a failed one: 42
+close frees the slot: yes
+reconnect with no spare slot: 42
+reconnecting client with no slot: err
+reconnecting client recovers: yes

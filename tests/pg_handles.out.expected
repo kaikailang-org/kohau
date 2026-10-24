@@ -1,0 +1,6 @@
+idle: ok
+in transaction: ok
+in failed transaction: ok
+idle again: ok
+bound reached: yes
+finish frees every slot: yes

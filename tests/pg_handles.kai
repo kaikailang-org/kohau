@@ -1,0 +1,97 @@
+# tests/pg_handles.kai — transaction state and handle bookkeeping on
+# the low-level surface.
+#
+# Cases:
+#   1. transaction_status walks IDLE -> INTRANS -> INERROR -> IDLE
+#      through BEGIN, a failing statement and ROLLBACK, and each
+#      state matches its named constant.
+#   2. The shim tracks a bounded number of connection objects. Past
+#      that bound `connect` is a typed `None`, not a handle.
+#   3. `finish` gives the slot back: after finishing every handle, the
+#      same number can be opened again.
+#
+# Cases 2 and 3 use a conninfo that names a socket directory which
+# does not exist, so each connect fails at once without reaching a
+# server — a failed connection still occupies a slot until `finish`.
+# The bound itself is never printed, only whether it was reached.
+#
+# Requires a server for case 1 (see the Makefile's tier1-pg target).
+
+import kohau.postgres
+
+const NOWHERE : String = "host=/nonexistent/kohau-pg-handles"
+
+# Far above the shim's bound; reaching it means `connect` never
+# reported exhaustion.
+const FILL_CAP : Int = 1000
+
+fn run(c: Conn, sql: String) : Unit / Ffi = match postgres.exec(c, sql, []) {
+  None -> ()
+  Some(r) -> {
+    let _ = postgres.clear(r)
+    ()
+  }
+}
+
+fn show_state(label: String, c: Conn, want: Int) : Unit / Console + Ffi =
+  Stdout.print(label ++ (if postgres.transaction_status(c) == want { ": ok" } else { ": FAIL" }))
+
+fn check_tx_states(c: Conn) : Unit / Console + Ffi {
+  show_state("idle", c, PQTRANS_IDLE)
+  run(c, "BEGIN")
+  show_state("in transaction", c, PQTRANS_INTRANS)
+  run(c, "SELECT 1/0")
+  show_state("in failed transaction", c, PQTRANS_INERROR)
+  run(c, "ROLLBACK")
+  show_state("idle again", c, PQTRANS_IDLE)
+}
+
+# Open unreachable connections until `connect` refuses, returning the
+# handles obtained.
+fn fill(acc: [Conn], n: Int) : [Conn] / Ffi = if n >= FILL_CAP {
+  acc
+} else {
+  match postgres.connect(NOWHERE) {
+    None -> acc
+    Some(c) -> fill([c, ...acc], n + 1)
+  }
+}
+
+fn finish_all(cs: [Conn]) : Unit / Ffi = match cs {
+  [] -> ()
+  [c, ...rest] -> {
+    let _ = postgres.finish(c)
+    finish_all(rest)
+  }
+}
+
+fn count(cs: [Conn]) : Int = match cs {
+  [] -> 0
+  [_, ...rest] -> 1 + count(rest)
+}
+
+fn check_slots() : Unit / Console + Ffi {
+  let first = fill([], 0)
+  let n = count(first)
+  Stdout.print("bound reached: " ++ (if n > 0 and n < FILL_CAP { "yes" } else { "no" }))
+  finish_all(first)
+  let second = fill([], 0)
+  Stdout.print("finish frees every slot: " ++ (if count(second) == n { "yes" } else { "no" }))
+  finish_all(second)
+}
+
+fn main() : Int / Console + Ffi {
+  match postgres.connect("") {
+    None -> Stdout.print("connect: none")
+    Some(c) -> {
+      if postgres.status(c) == CONNECTION_OK {
+        check_tx_states(c)
+      } else {
+        Stdout.print("connect: " ++ postgres.error_message(c))
+      }
+      let _ = postgres.finish(c)
+    }
+  }
+  check_slots()
+  0
+}
