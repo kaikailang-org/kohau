@@ -5,6 +5,65 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [Unreleased]
+
+### Fixed
+
+- **A reconnecting postgres client no longer drops its session over a
+  refusal of its own.** `with_reconnecting_client` reads a failure
+  with an empty SQLSTATE as a dropped connection, but two failures the
+  cell raises on a perfectly live connection carried no code either: a
+  `query_row` that matched several rows, and a statement whose bind
+  list is past the shim's ceiling. Either one made the cell reconnect,
+  and the reconnect discarded the open transaction: what ran before it
+  went with the old session, what ran after it autocommitted, and the
+  closing COMMIT — answered with a successful "no transaction in
+  progress" — reported `Ok` for work that had partly vanished. They
+  now carry `21000` (cardinality_violation, the server's own code for
+  a subquery returning too many rows) and `54000`
+  (program_limit_exceeded), surface as ordinary errors, and leave the
+  session alone. Their error strings gain the code prefix
+  (`21000: query_row: ...`).
+
+### Added
+
+- **Fixtures for what the suite could not see.** A mutation sweep of
+  all four modules left 53 changes to the code that no fixture
+  noticed, most of them a dropped `finalize`, `finish` or `reset`.
+  The new and extended fixtures make each one observable:
+
+  - `tests/client_teardown.kai` drives every path on which the SQLite
+    cell drops a statement — eviction, a cursor failing at open or
+    mid-scan, a cursor drained, closed or left open — then checks
+    from a second connection that the cell's connection really
+    closed. libsqlite3 refuses to close over a live statement and the
+    cell discards that refusal, so a single lost `finalize` used to
+    leave the whole connection open without a trace. It runs on a
+    file database, which also pins the switch to WAL.
+  - `tests/pg_handles.kai` walks `transaction_status` through every
+    state against its named constant, and checks that the shim's
+    connection slots are bounded and that `finish` returns them.
+  - `tests/pg_client_release.kai` takes every connection slot first,
+    so a connection the cell fails to finish — on a failed connect,
+    on `close`, or across a reconnect — shows up as the next connect
+    failing; it also covers a reconnecting client that starts with no
+    connection and recovers once one is available.
+  - `tests/pg_client_session.kai` checks that a reconnecting client
+    stays on one backend across successful requests and across the
+    two refusals above, and that a plain client does not reconnect.
+  - Existing fixtures now check the SQLite constants against what
+    libsqlite3 returns, a failing `prepare`, `error_to_string`'s
+    three renderings, a fresh cache's counters, cursor binds, and —
+    through `DROP TABLE`, which SQLite refuses while any statement is
+    still reading — that a half-consumed query, an early-stopped
+    fold and a closed cursor all stop reading.
+
+  Mutants that cannot be killed because they change nothing are
+  listed with their reasons in `tools/mutate-known-equivalent.txt`.
+  Two survivors remain on purpose: dropping a `PQclear` leaks client
+  memory and nothing else, which no output-comparing fixture can see.
+  tier1 grows from 10 to 11 fixtures and tier1-pg from 7 to 10.
+
 ## [0.5.0] — 2026-10-12
 
 ### Added
