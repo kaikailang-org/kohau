@@ -4,3 +4,21 @@
 kohau/postgres/client.kai:175:compare  # parse_digits: `i >= len` vs `i > len` is the same function. At i == len the mutant falls through to char_at, which returns None for an out-of-range index, and the None arm yields the same acc the bounds check would have.
 
 kohau/postgres/client.kai:180:connect  # parse_digits: `or` -> `and` makes the non-digit guard unreachable, but its input is libpq's cmd_tuples, which is digits or empty by contract. No statement can produce a non-digit there, so both forms agree on every reachable input. Delete this entry if parse_count is ever called on arbitrary text.
+
+kohau/sqlite/client.kai:376:literal  # cache_trim: the tail after the first finalized entry is always empty. cache_trim is only called on the cache plus one new entry, so at most one entry is past capacity, and trimming [] with any budget yields [].
+
+kohau/sqlite/client.kai:396:call  # cache_take: a cached statement is always already reset. Every operation hands its statement back through cache_release, which resets it, and nothing else touches cached statements, so the reset on a hit is a no-op.
+
+kohau/sqlite/client.kai:476:call  # with_stmt: on the bind-failure path the statement has not been stepped since cache_take reset it, so the reset is a no-op. The bindings it leaves are cleared by cache_take on the next hit.
+
+kohau/sqlite/client.kai:634:literal  # close_conn: the result for a cell with no connection is discarded by the Shutdown arm, its only caller.
+
+kohau/sqlite/client.kai:827:literal  # set_wal: the result for a missing connection is discarded by with_client, its only caller; the journal mode switch is advisory.
+
+kohau/postgres.kai:191:call  # exec: the parameter buffer is already empty on entry. kai_pg_exec_params clears it on every path, and exec resets it when push_binds fails, so the leading reset is a no-op.
+
+kohau/postgres.kai:201:call  # exec: the buffer left by a failed push is never read. The next exec resets it before pushing and finish frees it, so dropping this reset only delays the free.
+
+kohau/postgres.kai:213:literal  # push_binds: every push failure is either latched by the shim (ceiling, allocation) or has no slot at all, and kai_pg_exec_params returns 0 in both cases, so continuing to exec yields the same None as stopping.
+
+kohau/postgres/client.kai:272:literal  # close_conn: the result for a cell with no connection is discarded by both callers (the Shutdown arm and reopen).
