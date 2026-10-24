@@ -9,14 +9,20 @@
 #      every row exactly once.
 #   2. The chunking is real — a 100-row scan at 30 rows a chunk
 #      takes four fetches, not one.
-#   3. FoldStop ends the scan early and the rest is never read.
+#   3. FoldStop ends the scan early and the rest is never read, and
+#      the abandoned cursor stops reading.
 #   4. A cursor read to its end is gone; fetching again is a typed
 #      error, not a crash.
-#   5. close_cursor on a live cursor has the same effect, and is a
-#      no-op on one already finished.
+#   5. close_cursor on a live cursor has the same effect, stops it
+#      reading, and is a no-op on one already finished.
 #   6. Two cursors over the same SQL advance independently — the
 #      reason a cursor does not take its statement from the cache.
 #   7. An open cursor does not block a write on the same connection.
+#   8. A cursor binds its parameters like every other operation.
+#
+# "Stops reading" is checked with DROP TABLE, which SQLite refuses
+# (SQLITE_LOCKED) while any statement on the connection is still
+# mid-result.
 
 import actor
 
@@ -57,6 +63,11 @@ fn row_count(rows: [[String]]) : Int = match rows {
 # took to get there.
 type Progress = { total: Int, chunks: Int }
 
+fn render_exec(r: Result[Int, SqliteError]) : String = match r {
+  Ok(_) -> "ok"
+  Err(e) -> "err code=" ++ int_to_string(e.code)
+}
+
 fn render_chunk_result(r: Result[Progress, SqliteError]) : String = match r {
   Ok(p) -> "total=" ++ (int_to_string(p.total) ++ (" chunks=" ++ int_to_string(p.chunks)))
   Err(e) -> "err code=" ++ int_to_string(e.code)
@@ -64,6 +75,8 @@ fn render_chunk_result(r: Result[Progress, SqliteError]) : String = match r {
 
 fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   let _ = client.exec(c, "CREATE TABLE nums (n INTEGER PRIMARY KEY)", [])
+  let _ = client.exec(c, "CREATE TABLE scratch_stop (x)", [])
+  let _ = client.exec(c, "CREATE TABLE scratch_close (x)", [])
   seed(c, 1, 100)
 
   # ---- 1 and 2. a full scan, in chunks ----
@@ -98,6 +111,7 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
     chunks: acc.chunks + 1,
   }))
   show("stopped early", render_chunk_result(stopped))
+  show("drop after early stop", render_exec(client.exec(c, "DROP TABLE scratch_stop", [])))
 
   # ---- 4. a finished cursor is gone ----
   match client.open_cursor(c, "SELECT n FROM nums WHERE n <= 5 ORDER BY n", []) {
@@ -124,6 +138,7 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
     Ok(cur) -> {
       let _ = client.fetch_chunk(c, cur, 5)
       client.close_cursor(c, cur)
+      show("drop after close", render_exec(client.exec(c, "DROP TABLE scratch_close", [])))
       match client.fetch_chunk(c, cur, 5) {
         Ok(_) -> show("fetch after close", "unexpectedly ok")
         Err(e) -> show("fetch after close", "err code=" ++ int_to_string(e.code))
@@ -170,6 +185,14 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
       client.close_cursor(c, cur)
     }
   }
+
+  # ---- 8. a cursor with binds ----
+  # 1..10 sums to 55.
+  let bound = client.fold_chunks(c, "SELECT n FROM nums WHERE n <= ? ORDER BY n", [BindInt(10)], 4, Progress { total: 0, chunks: 0 }, (acc, rows) => FoldMore(Progress {
+    total: sum_chunk(rows, acc.total),
+    chunks: acc.chunks + 1,
+  }))
+  show("bound scan", render_chunk_result(bound))
 
   client.close(c)
 }

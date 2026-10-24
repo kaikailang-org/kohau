@@ -18,4 +18,14 @@ cleared to NULL: ok
 constraint rc: ok
 errcode: ok
 extended errcode: ok
+SQLITE_OK: ok
+SQLITE_ROW: ok
+SQLITE_INTEGER: ok
+SQLITE_FLOAT: ok
+SQLITE_TEXT: ok
+SQLITE_BLOB: ok
+SQLITE_NULL: ok
+SQLITE_DONE: ok
+bad sql is None: ok
+bad sql errcode: ok
 close: ok

@@ -15,6 +15,8 @@
 #      the deferred form.
 #   5. **A caller-authored abort reason** carries code 0, so it can
 #      never be mistaken for a SQLite failure.
+#   6. **error_to_string** shows the codes only when SQLite supplied
+#      them, and the extended code only when it refines the primary.
 #
 # Codes are printed, message text is not: the codes are stable across
 # libsqlite3 versions, the wording is not.
@@ -90,6 +92,12 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   # A caller-authored abort carries code 0 — never a SQLite code.
   show_code("immediate abort", tx_abort)
   show_count("uniq after abort", count_uniq(c))
+
+  # ---- 6. rendering ----
+  # Built by hand so the golden does not carry libsqlite3's wording.
+  Stdout.print("render local: " ++ client.error_to_string(SqliteError { code: 0, extended: 0, message: "no connection" }))
+  Stdout.print("render primary: " ++ client.error_to_string(SqliteError { code: 1, extended: 1, message: "syntax" }))
+  Stdout.print("render extended: " ++ client.error_to_string(SqliteError { code: 19, extended: 1555, message: "dup" }))
 
   client.close(c)
 }

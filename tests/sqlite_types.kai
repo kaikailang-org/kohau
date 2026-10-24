@@ -9,6 +9,9 @@
 #   4. bind_blob_hex rejecting malformed hex
 #   5. clear_bindings dropping a value a reused statement would keep
 #   6. errcode / extended_errcode on a constraint violation
+#   7. the named constants agree with what libsqlite3 returns, so a
+#      caller comparing against them branches the way it means to
+#   8. prepare on malformed SQL is a typed absence, not a handle
 #
 # Reals are compared as values, never rendered, so the goldens do not
 # depend on float formatting.
@@ -136,6 +139,42 @@ fn check_errcodes(db: Db) : Unit / Ffi + Stdout {
   check_eq_int("extended errcode", sqlite.extended_errcode(db), 1555)
 }
 
+# ---- named constants ----
+
+# Each constant is compared against a value libsqlite3 actually
+# produced, never against a literal: a wrong constant would send a
+# caller down the wrong branch while every literal check still passed.
+fn check_constants(db: Db) : Unit / Ffi + Stdout {
+  check_ok("SQLITE_OK", sqlite.exec(db, "CREATE TABLE consts (x)") == sqlite.SQLITE_OK)
+  match sqlite.prepare(db, "SELECT 1, 1.5, 'a', x'00', NULL") {
+    None -> check_ok("storage class constants", false)
+    Some(stmt) -> {
+      check_ok("SQLITE_ROW", sqlite.step(stmt) == sqlite.SQLITE_ROW)
+      check_ok("SQLITE_INTEGER", sqlite.column_type(stmt, 0) == sqlite.SQLITE_INTEGER)
+      check_ok("SQLITE_FLOAT", sqlite.column_type(stmt, 1) == sqlite.SQLITE_FLOAT)
+      check_ok("SQLITE_TEXT", sqlite.column_type(stmt, 2) == sqlite.SQLITE_TEXT)
+      check_ok("SQLITE_BLOB", sqlite.column_type(stmt, 3) == sqlite.SQLITE_BLOB)
+      check_ok("SQLITE_NULL", sqlite.column_type(stmt, 4) == sqlite.SQLITE_NULL)
+      check_ok("SQLITE_DONE", sqlite.step(stmt) == sqlite.SQLITE_DONE)
+      let _ = sqlite.finalize(stmt)
+    }
+  }
+}
+
+# ---- prepare failure ----
+
+# Malformed SQL yields `None`, and the connection reports why.
+fn check_prepare_failure(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELEC 1") {
+  None -> {
+    check_ok("bad sql is None", true)
+    check_eq_int("bad sql errcode", sqlite.errcode(db), 1)
+  }
+  Some(stmt) -> {
+    check_ok("bad sql is None", false)
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
 fn run_with_db(db: Db) : Int / Console + Ffi {
   check_real(db, 3.5)
   check_null(db)
@@ -144,6 +183,8 @@ fn run_with_db(db: Db) : Int / Console + Ffi {
   check_bad_hex(db)
   check_clear_bindings(db)
   check_errcodes(db)
+  check_constants(db)
+  check_prepare_failure(db)
   check_eq_int("close", sqlite.close(db), 0)
   0
 }

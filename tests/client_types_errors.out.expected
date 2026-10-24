@@ -9,3 +9,6 @@ immediate commit: Ok(1)
 uniq after commit: 2
 immediate abort: Err code=0 extended=0
 uniq after abort: 2
+render local: no connection
+render primary: syntax [1]
+render extended: dup [19/1555]

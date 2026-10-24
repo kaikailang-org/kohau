@@ -6,6 +6,7 @@
 # observable result.
 #
 # Cases:
+#   0. A fresh cell has compiled and holds nothing.
 #   1. Repeating one statement compiles it once.
 #   2. A reused statement does not leak the previous call's binding
 #      into a call that binds nothing — the clear_bindings path.
@@ -63,8 +64,13 @@ fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n 
 }
 
 fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  # ---- 0. a fresh cache ----
+  show_int("compiled at start", compiled(c))
+  show_int("held at start", held(c))
+
   # ---- 1. one statement, compiled once ----
   let _ = client.exec(c, "CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+  let _ = client.exec(c, "CREATE TABLE scratch (x)", [])
   let base = compiled(c)
   insert_n(c, 1, 20)
   # 20 inserts of the same SQL: exactly one compilation.
@@ -85,8 +91,10 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   # again must start over, not resume.
   show("first of many (1st call)", render_row(client.query_row(c, "SELECT id FROM t ORDER BY id", [])))
   show("first of many (2nd call)", render_row(client.query_row(c, "SELECT id FROM t ORDER BY id", [])))
-  # The released statement holds no read lock, so a write proceeds.
-  show_int("write after half-consumed read", scalar(c, "SELECT COUNT(*) FROM t WHERE id = ?", [BindInt(1)]))
+  # The released statement is no longer mid-iteration. DROP TABLE is
+  # the probe: SQLite refuses it (SQLITE_LOCKED) while any statement
+  # on the connection is still reading.
+  show("drop after half-consumed read", render_exec(client.exec(c, "DROP TABLE scratch", [])))
 
   # ---- 4. eviction, and life after it ----
   # Capacity is 16; 40 distinct statements force eviction.
@@ -103,6 +111,11 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   show("select * after ALTER", render_row(client.query_row(c, "SELECT * FROM t ORDER BY id", [])))
 
   client.close(c)
+}
+
+fn render_exec(r: Result[Int, SqliteError]) : String = match r {
+  Ok(_) -> "ok"
+  Err(e) -> "err code=" ++ int_to_string(e.code)
 }
 
 # Render a query_row result as a compact, golden-stable string.
