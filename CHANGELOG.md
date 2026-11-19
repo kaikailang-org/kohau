@@ -5,6 +5,18 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [0.5.2] — 2026-11-19
+
+### Fixed
+
+- **kohau builds on kaikai 0.192 and later.** The compiler now rejects
+  uppercase type parameters, and the SQLite and postgres clients named
+  their result parameter `R` in `with_client`, `with_reconnecting_client`,
+  `with_tx` and `with_tx_mode`. It is `r` now; no caller changes.
+  Verified on kaikai 0.195.0 and 0.196.3.
+- **ahu is pinned to v0.3.0**, the first ahu release that builds on
+  the same compilers.
+
 ## [0.5.1] — 2026-10-24
 
 ### Fixed
