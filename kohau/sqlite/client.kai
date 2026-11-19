@@ -812,7 +812,7 @@ fn sql_loop(st: CellState) : Unit / Actor[SqlMsg] + Ffi {
 # a different mode issues `PRAGMA journal_mode = ...` through
 # `exec` and it wins.
 #[unstable]
-pub fn with_client[R, e](path: String, body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e) : R / Spawn + Ffi + Actor[SqlMsg] + e {
+pub fn with_client[r, e](path: String, body: (Pid[SqlMsg]) -> r / Actor[SqlMsg] + e) : r / Spawn + Ffi + Actor[SqlMsg] + e {
   let db = sqlite.open(path)
   let _ = set_wal(db)
   let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty(), cursors: [], next_id: 1 }))
@@ -1130,7 +1130,7 @@ pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] = Actor.send(c, Shutdown)
 #     case; the cell's per-op statement isolation limits the blast
 #     radius.
 #[unstable]
-pub fn with_tx[R, e](c: Pid[SqlMsg], body: (Pid[SqlMsg]) -> Result[R, SqliteError] / Actor[SqlMsg] + e) : Result[R, SqliteError] / Actor[SqlMsg] + e = with_tx_mode(c, Deferred, body)
+pub fn with_tx[r, e](c: Pid[SqlMsg], body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Actor[SqlMsg] + e) : Result[r, SqliteError] / Actor[SqlMsg] + e = with_tx_mode(c, Deferred, body)
 
 # Locking mode for a transaction scope, as the `BEGIN` variant it
 # emits. SQLite takes locks lazily by default, which is the right
@@ -1175,7 +1175,7 @@ fn prefixed(e: SqliteError, prefix: String) : SqliteError = SqliteError {
 # `with_tx` with an explicit locking mode — see `TxMode`. Identical
 # in every other respect, including the v1 limitations above.
 #[unstable]
-pub fn with_tx_mode[R, e](c: Pid[SqlMsg], mode: TxMode, body: (Pid[SqlMsg]) -> Result[R, SqliteError] / Actor[SqlMsg] + e) : Result[R, SqliteError] / Actor[SqlMsg] + e = match exec(c, begin_sql(mode), []) {
+pub fn with_tx_mode[r, e](c: Pid[SqlMsg], mode: TxMode, body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Actor[SqlMsg] + e) : Result[r, SqliteError] / Actor[SqlMsg] + e = match exec(c, begin_sql(mode), []) {
   Err(e) -> Err(prefixed(e, "BEGIN failed"))
   Ok(_) -> {
     let result = body(c)

@@ -433,7 +433,7 @@ fn live_conn(conninfo: String) : Option[Conn] / Ffi = match postgres.connect(con
 # helper replies `PgErr("", "no connection: connect failed")` and
 # `close` still shuts the cell down cleanly.
 #[unstable]
-pub fn with_client[R, e](conninfo: String, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e =
+pub fn with_client[r, e](conninfo: String, body: (Pid[PgMsg]) -> r / Actor[PgMsg] + e) : r / Spawn + Ffi + Actor[PgMsg] + e =
   spawn_client(conninfo, false, body)
 
 # `with_client` plus reconnection: when a statement fails because the
@@ -465,10 +465,10 @@ pub fn with_client[R, e](conninfo: String, body: (Pid[PgMsg]) -> R / Actor[PgMsg
 # than parking the fiber. Rate-limiting a reconnect storm belongs to
 # the supervisor above (ahu's `with_restart_backoff`), not here.
 #[unstable]
-pub fn with_reconnecting_client[R, e](conninfo: String, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e =
+pub fn with_reconnecting_client[r, e](conninfo: String, body: (Pid[PgMsg]) -> r / Actor[PgMsg] + e) : r / Spawn + Ffi + Actor[PgMsg] + e =
   spawn_client(conninfo, true, body)
 
-fn spawn_client[R, e](conninfo: String, reconnect: Bool, body: (Pid[PgMsg]) -> R / Actor[PgMsg] + e) : R / Spawn + Ffi + Actor[PgMsg] + e {
+fn spawn_client[r, e](conninfo: String, reconnect: Bool, body: (Pid[PgMsg]) -> r / Actor[PgMsg] + e) : r / Spawn + Ffi + Actor[PgMsg] + e {
   let st = PgState { conn: live_conn(conninfo), conninfo: conninfo, reconnect: reconnect }
   let pid = spawn_actor(() => pg_loop(st))
   body(pid)
@@ -597,7 +597,7 @@ pub fn close(c: Pid[PgMsg]) : Unit / Actor[PgMsg] = Actor.send(c, PgShutdown)
 #   - **Rollback errors are swallowed**, so the body's original `Err`
 #     propagates rather than being masked.
 #[unstable]
-pub fn with_tx[R, e](c: Pid[PgMsg], body: (Pid[PgMsg]) -> Result[R, String] / Actor[PgMsg] + e) : Result[R, String] / Actor[PgMsg] + e = match exec(c, "BEGIN", []) {
+pub fn with_tx[r, e](c: Pid[PgMsg], body: (Pid[PgMsg]) -> Result[r, String] / Actor[PgMsg] + e) : Result[r, String] / Actor[PgMsg] + e = match exec(c, "BEGIN", []) {
   Err(msg) -> Err("BEGIN failed: " ++ msg)
   Ok(_) -> {
     let result = body(c)
