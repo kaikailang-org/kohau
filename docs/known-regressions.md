@@ -8,6 +8,44 @@ and whether it blocks tier1.
 This file follows ahu's convention: bugs found outside kohau's lane
 are documented here, not fixed inline. kohau does not patch kaikai.
 
+## kaikai 0.196.3
+
+### `kai lint` and `kai typecheck` reject a module of an import cycle as entry
+
+**Symptom.** `kohau.sqlite.client` and its three internal modules
+(`client_cell`, `client_cache`, `client_cursors`) import each other,
+which kaikai allows between modules of one package. A build that
+reaches them through an import accepts the cycle. A command whose
+entry file is itself one of the four does not:
+
+```
+$ kai typecheck kohau/sqlite/client.kai
+error: import cycle detected: .../client.kai -> .../client_cache.kai
+       -> .../client.kai; cycles are allowed only between modules of
+       one package (files under one kai.toml)
+```
+
+`kai lint kohau/sqlite/client.kai` fails the same way, and so does
+`kai lint .` when it reaches those files. Reproduces in a two-module
+package with nothing else in it, so it is not specific to kohau.
+
+**Why the cycle exists.** The internal modules need the protocol
+types (`Bind`, `SqliteError`, `SqlReply`, `SqlMsg`), and those must
+stay in `kohau.sqlite.client`: kaikai has no re-exports, so moving
+them would change what consumers import.
+
+**Workaround.** Lint or typecheck a fixture that imports the client;
+the diagnostics for all four modules are reported through it:
+
+```
+$ kai lint tests/client_cursor.kai
+```
+
+**Blocks tier1.** No. `kai build`, the fixtures, a consumer package
+depending on kohau, and `kai mutate --module` are unaffected.
+
+**Status.** Open upstream, not yet filed.
+
 ## kaikai 0.118.0
 
 ### `kai mutate` cannot compile mutants of the cell-wrapped clients

@@ -1,0 +1,153 @@
+# kohau/sqlite/client_cursors.kai — the SQLite client's cursors.
+# Internal to the package: `kohau.sqlite.client` is the surface.
+#
+# `query_rows` materialises a whole result set before replying,
+# which is the wrong shape for a scan larger than memory. A cursor
+# keeps the statement open across mailbox round-trips instead, so
+# the caller pulls a bounded chunk at a time.
+#
+# **The caller never sees the statement.** A `Stmt` is an FFI
+# pointer into the cell's address space; sending one across the
+# mailbox would hand out a handle whose lifetime the recipient
+# cannot reason about. The reply carries an `Int` id and the cell
+# keeps the mapping, so a stale id is a typed error rather than a
+# dangling pointer.
+#
+# **A cursor's statement is never the cache's.** A cached statement
+# is reset and rebound by whoever takes it next; a cursor's must
+# survive untouched between fetches, and two cursors over the same
+# SQL need separate statements. So a cursor compiles its own and
+# finalizes it on close — cursors cost a parse, and are for the
+# scans that earn it.
+
+import kohau.sqlite
+
+import kohau.sqlite.client
+
+import kohau.sqlite.client_cell
+
+# A statement being consumed across several fetches. `ncols` is read
+# once at open, before the first step.
+pub(pkg) type LiveCursor = { id: Int, stmt: Stmt, ncols: Int }
+
+# Take the cursor with `id` out of the list, returning it and the
+# rest. `None` when no cursor has that id.
+fn cursor_extract(cursors: [LiveCursor], id: Int) : Option[(LiveCursor, [LiveCursor])] = match cursors {
+  [] -> None
+  [c, ...rest] -> if c.id == id {
+    Some((c, rest))
+  } else {
+    match cursor_extract(rest, id) {
+      None -> None
+      Some((found, others)) -> Some((found, [c, ...others]))
+    }
+  }
+}
+
+# Read up to `budget` rows from an open cursor. Returns the rows and
+# whether the result set ended. Rows accumulate reversed and are
+# flipped once, as `collect_rows` does.
+fn fetch_rows(db: Db, cur: LiveCursor, budget: Int, acc: [[String]]) : Result[([[String]], Bool), SqliteError] / Ffi = if budget <= 0 {
+  # Budget spent with the statement still mid-result: more to come.
+  Ok((reverse_rows(acc, []), false))
+} else {
+  let rc = sqlite.step(cur.stmt)
+  if rc == sqlite.SQLITE_ROW {
+    let row = read_text_cols(cur.stmt, 0, cur.ncols)
+    fetch_rows(db, cur, budget - 1, [row, ...acc])
+  } else if rc == sqlite.SQLITE_DONE {
+    Ok((reverse_rows(acc, []), true))
+  } else {
+    Err(db_error(db, "step"))
+  }
+}
+
+# Finalize every open cursor's statement. Called before the
+# connection closes, for the same reason the cache is finalized.
+pub(pkg) fn cursors_finalize_all(cursors: [LiveCursor]) : Unit / Ffi = match cursors {
+  [] -> ()
+  [c, ...rest] -> {
+    let _ = sqlite.finalize(c.stmt)
+    cursors_finalize_all(rest)
+  }
+}
+
+# The error for an id that names no open cursor — closed already, or
+# never opened. Carries code 0 like every failure that did not come
+# from SQLite.
+fn unknown_cursor(id: Int) : SqliteError = local_error("unknown cursor: " ++ int_to_string(id))
+
+# Compile a statement for a cursor, bind it, and register it under a
+# fresh id. Unlike the pooled operations this does not touch the
+# cache: a cursor owns its statement, as the header explains.
+pub(pkg) fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> match sqlite.prepare(d, sql) {
+    None -> {
+      Actor.send(reply_to, Reply(SqlErr(db_error(d, "prepare"))))
+      st
+    }
+    Some(stmt) -> {
+      let rc_bind = apply_binds(stmt, 1, binds)
+      if rc_bind != 0 {
+        let err = db_error(d, "bind")
+        let _ = sqlite.finalize(stmt)
+        Actor.send(reply_to, Reply(SqlErr(err)))
+        st
+      } else {
+        let cur = LiveCursor { id: st.next_id, stmt: stmt, ncols: sqlite.column_count(stmt) }
+        Actor.send(reply_to, Reply(CursorReady(st.next_id)))
+        CellState { db: st.db, cache: st.cache, cursors: [cur, ...st.cursors], next_id: st.next_id + 1 }
+      }
+    }
+  }
+}
+
+# Pull the next chunk from a cursor. A cursor that reaches the end
+# of its result set, or hits an error, is finalized and dropped here
+# — so the common path (read until `end`) needs no explicit close,
+# and a failed cursor cannot be fetched from again.
+pub(pkg) fn handle_cursor_fetch(st: CellState, id: Int, budget: Int, reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> match cursor_extract(st.cursors, id) {
+    None -> {
+      Actor.send(reply_to, Reply(SqlErr(unknown_cursor(id))))
+      st
+    }
+    Some((cur, rest)) -> match fetch_rows(d, cur, budget, []) {
+      Err(e) -> {
+        let _ = sqlite.finalize(cur.stmt)
+        Actor.send(reply_to, Reply(SqlErr(e)))
+        CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+      }
+      Ok((rows, done)) -> {
+        Actor.send(reply_to, Reply(Chunk(rows, done)))
+        if done {
+          let _ = sqlite.finalize(cur.stmt)
+          CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+        } else {
+          # Still live: put it back at the front, where the next
+          # fetch will find it first.
+          CellState { db: st.db, cache: st.cache, cursors: [cur, ...rest], next_id: st.next_id }
+        }
+      }
+    }
+  }
+}
+
+# Close a cursor early. Fire-and-forget, and a no-op for an id that
+# is already gone — a caller abandoning a scan should not have to
+# know whether it happened to end on the last chunk.
+pub(pkg) fn handle_cursor_close(st: CellState, id: Int) : CellState / Ffi = match cursor_extract(st.cursors, id) {
+  None -> st
+  Some((cur, rest)) -> {
+    let _ = sqlite.finalize(cur.stmt)
+    CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
+  }
+}
