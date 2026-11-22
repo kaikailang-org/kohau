@@ -1,0 +1,235 @@
+# kohau/sqlite/client_cell.kai — the cell that owns the SQLite
+# client's connection: its state, the operations it runs, and the
+# loop that serves the mailbox. Internal to the package:
+# `kohau.sqlite.client` is the surface.
+
+import ahu.cell
+
+import kohau.sqlite
+
+import kohau.sqlite.client
+
+import kohau.sqlite.client_cache
+
+import kohau.sqlite.client_cursors
+
+# Bind one positional value onto a prepared statement. Returns the
+# SQLite rc (0 == SQLITE_OK).
+fn apply_bind(stmt: Stmt, idx: Int, b: Bind) : Int / Ffi = match b {
+  BindText(s) -> sqlite.bind_text(stmt, idx, s)
+  BindInt(n) -> sqlite.bind_int(stmt, idx, n)
+  BindReal(r) -> sqlite.bind_real(stmt, idx, r)
+  BindBlob(hex) -> sqlite.bind_blob_hex(stmt, idx, hex)
+  BindNull -> sqlite.bind_null(stmt, idx)
+}
+
+# Bind a whole list of positional values, starting at index `idx`.
+# Stops and returns the first non-OK rc; returns 0 if all bind
+# clean. Recursion (no loop) keeps it tail-shaped.
+pub(pkg) fn apply_binds(stmt: Stmt, idx: Int, binds: [Bind]) : Int / Ffi = match binds {
+  [] -> 0
+  [b, ...bs] -> {
+    let rc = apply_bind(stmt, idx, b)
+    if rc != 0 {
+      rc
+    } else {
+      apply_binds(stmt, idx + 1, bs)
+    }
+  }
+}
+
+# Read the first `n` TEXT columns of the current row into a list.
+# Builds the list head-first via recursion.
+pub(pkg) fn read_text_cols(stmt: Stmt, col: Int, n: Int) : [String] / Ffi = if col >= n {
+  []
+} else {
+  let v = sqlite.column_text(stmt, col)
+  [v, ...read_text_cols(stmt, col + 1, n)]
+}
+
+# The reply from one operation, plus the cache after it. Every
+# `run_*` threads the cache through: it may have gained the
+# statement this call compiled, or reordered by the hit it scored.
+type OpResult = { reply: SqlReply, cache: StmtCache }
+
+# Bind, then run `k` on the bound statement. Factors out the take /
+# bind / release sequence every operation shares, so each one is
+# left with only what it does differently. The statement is released
+# on every path, including the failing ones.
+fn with_stmt(cache: StmtCache, db: Db, sql: String, binds: [Bind], k: (Stmt) -> SqlReply / Ffi) : OpResult / Ffi = match cache_take(cache, db, sql) {
+  Err(e) -> OpResult { reply: SqlErr(e), cache: cache }
+  Ok(p) -> {
+    let rc_bind = apply_binds(p.stmt, 1, binds)
+    if rc_bind != 0 {
+      let err = db_error(db, "bind")
+      cache_release(p.stmt)
+      OpResult { reply: SqlErr(err), cache: p.cache }
+    } else {
+      let reply = k(p.stmt)
+      cache_release(p.stmt)
+      OpResult { reply: reply, cache: p.cache }
+    }
+  }
+}
+
+# Execute a no-row statement: bind, step once. Atomic — the
+# statement is fully consumed before this returns.
+fn run_exec(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  let rc_step = sqlite.step(stmt)
+  let changed = sqlite.changes(db)
+  # DONE, not OK, is success for a no-row statement.
+  if rc_step == sqlite.SQLITE_DONE {
+    ExecOk(changed)
+  } else {
+    SqlErr(db_error(db, "step"))
+  }
+})
+
+# Execute a ≤1-row statement. The column count is discovered from
+# the prepared statement, the same way `run_query_rows` does it, so
+# a caller can select any number of columns without declaring the
+# width. Returns RowFound(cols), RowAbsent, or SqlErr.
+fn run_query_row(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  # column_count is valid after prepare, before the first step.
+  let ncols = sqlite.column_count(stmt)
+  let rc_step = sqlite.step(stmt)
+  if rc_step == sqlite.SQLITE_ROW {
+    RowFound(read_text_cols(stmt, 0, ncols))
+  } else if rc_step == sqlite.SQLITE_DONE {
+    RowAbsent
+  } else {
+    SqlErr(db_error(db, "step"))
+  }
+})
+
+# Step a prepared statement to exhaustion, accumulating every row's
+# TEXT columns. `ncols` is read once from `sqlite.column_count` and
+# threaded in. `acc` carries the rows gathered so far in *reverse*
+# (prepended head-first for O(1) per row); the caller reverses once.
+# Returns `Ok(reversed_rows)` on a clean SQLITE_DONE, or `Err(msg)`
+# if a `step` returns anything other than ROW/DONE mid-iteration.
+fn collect_rows(db: Db, stmt: Stmt, ncols: Int, acc: [[String]]) : Result[[[String]], SqliteError] / Ffi {
+  let rc = sqlite.step(stmt)
+  if rc == sqlite.SQLITE_ROW {
+    let row = read_text_cols(stmt, 0, ncols)
+    collect_rows(db, stmt, ncols, [row, ...acc])
+  } else if rc == sqlite.SQLITE_DONE {
+    # Exhausted cleanly. acc is reverse order; flip it.
+    Ok(reverse_rows(acc, []))
+  } else {
+    Err(db_error(db, "step"))
+  }
+}
+
+# Reverse a list of rows. Local rather than a stdlib import to keep
+# the module's dependency surface minimal (the same discipline the
+# join/split helpers in henua's adapter follow).
+pub(pkg) fn reverse_rows(xs: [[String]], acc: [[String]]) : [[String]] = match xs {
+  [] -> acc
+  [x, ...rest] -> reverse_rows(rest, [x, ...acc])
+}
+
+# Execute a multi-row statement. Discovers the column count from the
+# prepared statement (`sqlite.column_count`), then steps to
+# exhaustion. Returns RowsFound(rows) — possibly empty — or SqlErr.
+fn run_query_rows(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  # column_count is valid after prepare, before the first step.
+  let ncols = sqlite.column_count(stmt)
+  match collect_rows(db, stmt, ncols, []) {
+    Ok(rows) -> RowsFound(rows)
+    Err(e) -> SqlErr(e)
+  }
+})
+
+# Execute a single-Int-column statement (COUNT, MAX, scalar SELECT).
+fn run_query_scalar(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
+  let rc_step = sqlite.step(stmt)
+  if rc_step == sqlite.SQLITE_ROW {
+    ScalarInt(sqlite.column_int(stmt, 0))
+  } else {
+    SqlErr(db_error(db, "step"))
+  }
+})
+
+# The cell's state: the connection, the statements compiled against
+# it, and the cursors currently open on it. `db` is `None` when the
+# open failed, so every request replies a typed `SqlErr` instead of
+# touching SQLite. Cache and cursors are meaningless without a
+# connection and stay empty in that case — the statements in them
+# belong to `db` and cannot outlive it.
+#
+# `next_id` only ever counts up, so a closed cursor's id is never
+# handed out again: a fetch on a stale id fails as unknown rather
+# than landing on some later cursor.
+pub(pkg) type CellState = { db: Option[Db], cache: StmtCache, cursors: [LiveCursor], next_id: Int }
+
+# Close the connection if the cell holds one, finalizing its
+# statements first — libsqlite3 refuses to close a connection with
+# live statements, and the handles die with it either way. Returns
+# the SQLite rc (`SQLITE_OK` when there was nothing to close).
+fn close_conn(st: CellState) : Int / Ffi = match st.db {
+  Some(d) -> {
+    cache_finalize_all(st.cache.entries)
+    cursors_finalize_all(st.cursors)
+    sqlite.close(d)
+  }
+  None -> 0
+}
+
+# The cell's step function. Each request runs to completion, replies,
+# and carries the (possibly grown or reordered) cache forward.
+#
+# Both query forms discover their column count from the prepared
+# statement, so they handle arbitrary SELECTs — including `SELECT *`
+# — without the caller declaring a width.
+fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] + Ffi = match msg {
+  Exec(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_exec(c, d, sql, binds)))
+  QueryRow(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_row(c, d, sql, binds)))
+  QueryRows(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_rows(c, d, sql, binds)))
+  QueryScalar(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_scalar(c, d, sql, binds)))
+  CacheStats(reply_to) -> {
+    # Answered from the cache alone: it needs no connection, so it
+    # reports honestly even on a cell whose open failed.
+    Actor.send(reply_to, Reply(CacheInfo(st.cache.compiled, cache_size(st.cache.entries))))
+    cell.keep(st)
+  }
+  CursorOpen(sql, binds, reply_to) -> cell.keep(handle_cursor_open(st, sql, binds, reply_to))
+  CursorFetch(id, budget, reply_to) -> cell.keep(handle_cursor_fetch(st, id, budget, reply_to))
+  CursorClose(id) -> cell.keep(handle_cursor_close(st, id))
+  Shutdown -> {
+    let _ = close_conn(st)
+    cell.cell_done()
+  }
+  Reply(_) ->
+  # A `Reply` never arrives at the cell's own mailbox; if one does
+  # (a misrouted message), ignore it and keep running.
+  cell.keep(st)
+}
+
+# Run one operation, send its reply, and return the state to carry
+# forward. With no connection the reply is the typed open-failure and
+# the state is untouched.
+fn dispatch(st: CellState, reply_to: Pid[SqlMsg], op: (StmtCache, Db) -> OpResult / Ffi) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+  None -> {
+    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    st
+  }
+  Some(d) -> {
+    let r = op(st.cache, d)
+    Actor.send(reply_to, Reply(r.reply))
+    CellState { db: st.db, cache: r.cache, cursors: st.cursors, next_id: st.next_id }
+  }
+}
+
+# The cell dispatch loop, spawned as its own fiber by `with_client`.
+# Mirrors ahu's internal `cell_loop` but lives here so `with_client`
+# can hand-spawn it (see `docs/design.md` on why `with_cell` is not
+# used: it shares one row variable between step and body, which would
+# leak this loop's `Ffi` into `with_client`'s body).
+pub(pkg) fn sql_loop(st: CellState) : Unit / Actor[SqlMsg] + Ffi {
+  let msg = Actor.receive()
+  match sql_step(st, msg) {
+    Continue(s) -> sql_loop(s)
+    Done -> ()
+  }
+}

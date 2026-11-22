@@ -1,0 +1,128 @@
+# kohau/sqlite/client_cache.kai — the SQLite client's prepared
+# statement cache. Internal to the package: `kohau.sqlite.client` is
+# the surface.
+#
+# Compiling SQL is the expensive half of a small statement, and a
+# cell serving one connection runs the same handful of statements
+# over and over. The cache keeps compiled statements alive across
+# operations, keyed by their SQL text.
+#
+# **An association list, not a Map.** At this size a linear scan is
+# a few string comparisons — nothing against the SQL parse it saves —
+# and the list order *is* the recency order, so the LRU needs no
+# second structure. Entries are held most-recently-used first: a hit
+# moves its entry to the front, an insertion past capacity finalizes
+# the entry that fell off the back.
+#
+# Keying on exact SQL text is what makes this safe: two calls share
+# a statement only when they are the same statement. Values never
+# enter the key — they are bound, never spliced — so the cache
+# cannot confuse two calls that differ only in their parameters.
+#
+# `prepare_v2` handles the one invalidation case that matters: when
+# DDL changes the schema under a cached statement, libsqlite3
+# recompiles it inside `step` rather than failing.
+
+import kohau.sqlite
+
+import kohau.sqlite.client
+
+# One compiled statement and the SQL it came from.
+pub(pkg) type CacheEntry = { sql: String, stmt: Stmt }
+
+# The cell's compiled-statement store. `entries` is ordered
+# most-recently-used first. `compiled` counts how many times the
+# cell has called `prepare` — the cache's whole purpose is to keep
+# that number below the operation count, and `cache_stats` exposes
+# it so a caller (or a fixture) can check that it does.
+pub(pkg) type StmtCache = { entries: [CacheEntry], capacity: Int, compiled: Int }
+
+# How many statements a cell keeps compiled. Sized for the working
+# set of a repository-style caller (a handful of CRUD statements,
+# plus BEGIN / COMMIT / ROLLBACK) with room to spare; every entry is
+# one small libsqlite3 allocation.
+const CACHE_CAPACITY : Int = 16
+
+pub(pkg) fn cache_empty() : StmtCache = StmtCache { entries: [], capacity: CACHE_CAPACITY, compiled: 0 }
+
+# Look `sql` up, returning its entry and the remaining entries with
+# it removed. The caller puts it back at the front, which is what
+# makes a hit "touch" the entry.
+fn cache_extract(entries: [CacheEntry], sql: String) : Option[(CacheEntry, [CacheEntry])] = match entries {
+  [] -> None
+  [e, ...rest] -> if e.sql == sql {
+    Some((e, rest))
+  } else {
+    match cache_extract(rest, sql) {
+      None -> None
+      Some((found, others)) -> Some((found, [e, ...others]))
+    }
+  }
+}
+
+# Drop and finalize everything past `n` entries. Returns the kept
+# prefix. Finalizing is what frees the libsqlite3 statement; losing
+# the handle without it leaks until the connection closes.
+fn cache_trim(entries: [CacheEntry], n: Int) : [CacheEntry] / Ffi = match entries {
+  [] -> []
+  [e, ...rest] -> if n <= 0 {
+    let _ = sqlite.finalize(e.stmt)
+    cache_trim(rest, 0)
+  } else {
+    [e, ...cache_trim(rest, n - 1)]
+  }
+}
+
+# A statement ready to run, plus the cache that now owns it.
+pub(pkg) type Prepared = { stmt: Stmt, cache: StmtCache }
+
+# Get a statement for `sql`, compiling it only on a miss. Either way
+# the returned statement is reset and has no bindings left from a
+# previous use, so the caller can bind straight onto it.
+pub(pkg) fn cache_take(cache: StmtCache, db: Db, sql: String) : Result[Prepared, SqliteError] / Ffi = match cache_extract(cache.entries, sql) {
+  Some((hit, rest)) -> {
+    # A hit may be mid-iteration if a previous query stopped early
+    # (query_row on a multi-row result), and it still carries that
+    # call's bindings. Reset rewinds it and releases any lock it
+    # holds; clear_bindings drops the stale values, so a parameter
+    # this call does not bind reads as NULL rather than as whatever
+    # the last call put there.
+    let _ = sqlite.reset(hit.stmt)
+    let _ = sqlite.clear_bindings(hit.stmt)
+    Ok(Prepared { stmt: hit.stmt, cache: StmtCache { entries: [hit, ...rest], capacity: cache.capacity, compiled: cache.compiled } })
+  }
+  None -> match sqlite.prepare(db, sql) {
+    None -> Err(db_error(db, "prepare"))
+    Some(stmt) -> {
+      let entry = CacheEntry { sql: sql, stmt: stmt }
+      let kept = cache_trim([entry, ...cache.entries], cache.capacity)
+      Ok(Prepared { stmt: stmt, cache: StmtCache { entries: kept, capacity: cache.capacity, compiled: cache.compiled + 1 } })
+    }
+  }
+}
+
+# Hand a statement back after an operation. Resetting here rather
+# than at the next take is what keeps a half-consumed query from
+# holding its read lock for as long as it sits in the cache.
+pub(pkg) fn cache_release(stmt: Stmt) : Unit / Ffi {
+  let _ = sqlite.reset(stmt)
+  ()
+}
+
+# Number of entries the cache holds.
+pub(pkg) fn cache_size(xs: [CacheEntry]) : Int = match xs {
+  [] -> 0
+  [_, ...rest] -> 1 + cache_size(rest)
+}
+
+# Finalize every cached statement. Called before the connection
+# closes: a statement outliving its connection is a use-after-free
+# waiting to happen, and libsqlite3 refuses to close a connection
+# that still has live statements.
+pub(pkg) fn cache_finalize_all(entries: [CacheEntry]) : Unit / Ffi = match entries {
+  [] -> ()
+  [e, ...rest] -> {
+    let _ = sqlite.finalize(e.stmt)
+    cache_finalize_all(rest)
+  }
+}

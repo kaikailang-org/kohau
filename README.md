@@ -313,6 +313,7 @@ kohau/
 ├── kohau/                      # the importable kaikai modules
 │   ├── sqlite.kai              # low-level: handles, bind/step/column, tx
 │   ├── sqlite/client.kai       # cell-wrapped: exec / query_* / with_tx
+│   ├── sqlite/client_*.kai     # its internals: cell loop, statement cache, cursors
 │   ├── postgres.kai            # low-level over libpq, SQLSTATE diagnostics
 │   └── postgres/client.kai     # cell-wrapped + opt-in reconnection
 ├── c/                          # shims for shapes kaikai's FFI cannot express
