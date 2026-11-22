@@ -5,6 +5,18 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [0.5.3] — 2026-11-22
+
+### Fixed
+
+- **A package that depends on kohau no longer links SQLite unless it
+  uses it.** The sqlite shim was declared for every build of the
+  package, so any program depending on kohau, or only on henua, linked
+  `libsqlite3` even when it imported nothing from `kohau.sqlite`. The
+  shim's `[native]` table is keyed by the `kohau.sqlite` module now:
+  only a build that imports it, directly or through the client,
+  compiles the shim and links the library.
+
 ## [0.5.2] — 2026-11-19
 
 ### Fixed
