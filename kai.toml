@@ -28,10 +28,12 @@ kohau__postgres__client = true
 
 # The sqlite shim travels with the package: a consumer that imports
 # `kohau.sqlite` gets it compiled and linked by plain `kai build`,
-# with no flags of its own. Only the sqlite shim — the postgres one
-# binds libpq, which lives outside the default search path on macOS,
-# and the table has no way to name a library directory.
-[native]
+# with no flags of its own, and a consumer that does not import it
+# links no sqlite at all. The key is the module path the compiler
+# reports, package name included: `[native.sqlite]` names no module
+# and is silently ignored. Only the sqlite shim — the postgres one
+# binds libpq, which lives outside the default search path on macOS.
+[native."kohau.sqlite"]
 sources = ["c/sqlite_shim.c"]
 include = ["c"]
 libs = ["sqlite3"]
