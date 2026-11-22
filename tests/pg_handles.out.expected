@@ -2,5 +2,8 @@ idle: ok
 in transaction: ok
 in failed transaction: ok
 idle again: ok
+result live until cleared: yes
+clear releases the result: yes
+no result left behind: yes
 bound reached: yes
 finish frees every slot: yes

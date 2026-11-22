@@ -213,6 +213,16 @@ int kai_pg_params_count(int64_t conn_handle) {
 
 // ---- execution ----
 
+// Results handed out by `exec_params` and not yet cleared, across
+// every connection. A result is plain memory with nothing else to
+// show whether it was released, so the count is what makes a missing
+// `clear` visible. Atomic: connections on different threads share it.
+static int kai_pg_live_results = 0;
+
+int kai_pg_results_live(void) {
+    return __atomic_load_n(&kai_pg_live_results, __ATOMIC_RELAXED);
+}
+
 // Execute `sql` with the accumulated parameters bound to `$1..$n` in
 // push order, then clear them. All values are sent as text
 // (paramTypes / paramLengths / paramFormats NULL, resultFormat 0), so
@@ -237,6 +247,7 @@ int64_t kai_pg_exec_params(int64_t conn_handle, const char *sql) {
                                  (const char *const *)slot->values,
                                  NULL, NULL, 0);
     kai_pg_slot_clear(slot);
+    if (res != NULL) __atomic_add_fetch(&kai_pg_live_results, 1, __ATOMIC_RELAXED);
     return (int64_t)res;
 }
 
@@ -328,5 +339,6 @@ int kai_pg_get_is_null(int64_t res_handle, int row, int col) {
 int kai_pg_clear(int64_t res_handle) {
     if (res_handle == 0) return 0;
     PQclear((PGresult *)res_handle);
+    __atomic_sub_fetch(&kai_pg_live_results, 1, __ATOMIC_RELAXED);
     return 0;
 }

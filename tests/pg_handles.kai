@@ -9,13 +9,16 @@
 #      that bound `connect` is a typed `None`, not a handle.
 #   3. `finish` gives the slot back: after finishing every handle, the
 #      same number can be opened again.
+#   4. A result is counted as live from `exec` until `clear`, and
+#      nothing the fixture ran is left uncleared.
 #
 # Cases 2 and 3 use a conninfo that names a socket directory which
 # does not exist, so each connect fails at once without reaching a
 # server — a failed connection still occupies a slot until `finish`.
 # The bound itself is never printed, only whether it was reached.
 #
-# Requires a server for case 1 (see the Makefile's tier1-pg target).
+# Requires a server for cases 1 and 4 (see the Makefile's tier1-pg
+# target).
 
 import kohau.postgres
 
@@ -44,6 +47,21 @@ fn check_tx_states(c: Conn) : Unit / Console + Ffi {
   show_state("in failed transaction", c, PQTRANS_INERROR)
   run(c, "ROLLBACK")
   show_state("idle again", c, PQTRANS_IDLE)
+}
+
+fn yes_no(b: Bool) : String = if b { "yes" } else { "no" }
+
+fn check_results(c: Conn) : Unit / Console + Ffi {
+  let before = postgres.live_results()
+  match postgres.exec(c, "SELECT 1", []) {
+    None -> Stdout.print("exec: none")
+    Some(r) -> {
+      Stdout.print("result live until cleared: " ++ yes_no(postgres.live_results() == before + 1))
+      let _ = postgres.clear(r)
+      Stdout.print("clear releases the result: " ++ yes_no(postgres.live_results() == before))
+    }
+  }
+  Stdout.print("no result left behind: " ++ yes_no(postgres.live_results() == 0))
 }
 
 # Open unreachable connections until `connect` refuses, returning the
@@ -86,6 +104,7 @@ fn main() : Int / Console + Ffi {
     Some(c) -> {
       if postgres.status(c) == CONNECTION_OK {
         check_tx_states(c)
+        check_results(c)
       } else {
         Stdout.print("connect: " ++ postgres.error_message(c))
       }
