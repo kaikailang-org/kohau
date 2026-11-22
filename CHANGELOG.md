@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [0.5.4] — 2026-11-22
+
+No change to the public surface or to behaviour: a consumer builds
+and runs as it did on 0.5.3.
+
+### Changed
+
+- **`kohau.sqlite.client` is four modules instead of one.** The
+  protocol types, the error values and the public API stay in
+  `kohau/sqlite/client.kai`; the cell's step function, the cursor
+  table and the statement cache move to `client_cell.kai`,
+  `client_cursors.kai` and `client_cache.kai`. The code moved
+  verbatim, and everything shared between the four is `pub(pkg)`, so
+  what a consumer imports is unchanged. The four modules import each
+  other, which kaikai 0.196.3 accepts in a build but not when one of
+  them is the entry file of `kai lint` or `kai typecheck`; see
+  `docs/known-regressions.md` for the workaround.
+- **The postgres client's reconnect logic reads as three decisions.**
+  `run_with_retry` is split into the choice to reconnect at all, the
+  attempt on the current connection, and what happens after a loss,
+  the one place where a statement can run a second time.
+
+### Added
+
+- **A dropped `clear` is now visible to the suite.** The postgres
+  shim counts the results libpq has handed out and not yet cleared,
+  readable inside the package only. `tests/pg_handles.kai` checks the
+  count around `exec` and `clear`, and `tests/pg_client_roundtrip.kai`
+  checks that the client leaves none behind, after statements that
+  succeeded and one that failed.
+- **`tests/sqlite_types.kai` covers two calls nothing observed:**
+  `bind_null` replacing a value the parameter already held, and
+  `errmsg` after a failed `prepare`.
+
 ## [0.5.3] — 2026-11-22
 
 ### Fixed
