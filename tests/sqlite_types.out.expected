@@ -5,6 +5,8 @@ null is SQLITE_NULL: ok
 '' is SQLITE_TEXT: ok
 0 is SQLITE_INTEGER: ok
 null reads as '': ok
+value before null: ok
+null replaces a value: ok
 blob bind rc: ok
 blob round-trip: ok
 blob column_type: ok
@@ -28,4 +30,5 @@ SQLITE_NULL: ok
 SQLITE_DONE: ok
 bad sql is None: ok
 bad sql errcode: ok
+bad sql errmsg present: ok
 close: ok
