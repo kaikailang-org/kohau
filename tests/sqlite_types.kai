@@ -3,7 +3,8 @@
 # Covers the low-level surface added for REAL / BLOB / NULL:
 #
 #   1. bind_real / column_real round-trip
-#   2. bind_null, and column_type telling NULL apart from '' and 0
+#   2. bind_null, and column_type telling NULL apart from '' and 0;
+#      bind_null replacing a value the parameter already held
 #   3. bind_blob_hex / column_blob_hex round-trip, including bytes
 #      that would truncate a NUL-terminated string
 #   4. bind_blob_hex rejecting malformed hex
@@ -11,7 +12,8 @@
 #   6. errcode / extended_errcode on a constraint violation
 #   7. the named constants agree with what libsqlite3 returns, so a
 #      caller comparing against them branches the way it means to
-#   8. prepare on malformed SQL is a typed absence, not a handle
+#   8. prepare on malformed SQL is a typed absence, not a handle,
+#      and errmsg says something about it
 #
 # Reals are compared as values, never rendered, so the goldens do not
 # depend on float formatting.
@@ -68,6 +70,22 @@ fn check_null(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?
     # The readers coerce NULL to the zero value of whatever they
     # read; only column_type distinguishes it.
     check_eq_str("null reads as ''", sqlite.column_text(stmt, 0), "")
+    let _ = sqlite.finalize(stmt)
+  }
+}
+
+# An unbound parameter already reads as NULL, so binding NULL to a
+# fresh statement proves nothing. Binding it over a value does.
+fn check_null_replaces(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, "SELECT ?") {
+  None -> check_ok("null replaces a value", false)
+  Some(stmt) -> {
+    let _ = sqlite.bind_text(stmt, 1, "held")
+    let _ = sqlite.step(stmt)
+    check_eq_int("value before null", sqlite.column_type(stmt, 0), 3)
+    let _ = sqlite.reset(stmt)
+    let _ = sqlite.bind_null(stmt, 1)
+    let _ = sqlite.step(stmt)
+    check_eq_int("null replaces a value", sqlite.column_type(stmt, 0), 5)
     let _ = sqlite.finalize(stmt)
   }
 }
@@ -168,6 +186,9 @@ fn check_prepare_failure(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db
   None -> {
     check_ok("bad sql is None", true)
     check_eq_int("bad sql errcode", sqlite.errcode(db), 1)
+    # The wording is libsqlite3's and changes between releases; only
+    # its presence is checked.
+    check_ok("bad sql errmsg present", sqlite.errmsg(db) != "")
   }
   Some(stmt) -> {
     check_ok("bad sql is None", false)
@@ -178,6 +199,7 @@ fn check_prepare_failure(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db
 fn run_with_db(db: Db) : Int / Console + Ffi {
   check_real(db, 3.5)
   check_null(db)
+  check_null_replaces(db)
   # 00 is the byte that would truncate a C string; ff is high-bit.
   check_blob(db, "00ff107a")
   check_bad_hex(db)
