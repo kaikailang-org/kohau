@@ -13,10 +13,14 @@
 #      discovered from the result.
 #   4. Binds are parameters: an injection payload round-trips as data.
 #   5. A failed statement surfaces its SQLSTATE through the Result.
+#   6. The cell clears every result it was given, on the paths that
+#      succeeded and on the one that failed.
 #
 # Requires a server (see the Makefile's tier1-pg target).
 
 import actor
+
+import kohau.postgres
 
 import kohau.postgres.client
 
@@ -106,5 +110,6 @@ fn main() : Int / Spawn + Ffi + Console {
   with_mailbox(() => {
     client.with_client("", body)
   })
+  Stdout.print("no result left behind: " ++ (if postgres.live_results() == 0 { "yes" } else { "no" }))
   0
 }
