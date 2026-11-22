@@ -332,32 +332,40 @@ fn reopen(st: PgState) : PgState / Ffi {
 # therefore never retried either — `with_tx` surfaces the failure and
 # the caller re-runs the whole scope.
 fn run_with_retry(st: PgState, retryable: Bool, op: (Conn) -> PgReply / Ffi) : (PgState, PgReply) / Ffi =
+  if st.reconnect {
+    run_reconnecting(st, retryable, op)
+  } else {
+    (st, with_conn(st.conn, op))
+  }
+
+# `run_with_retry` for a client that reconnects.
+fn run_reconnecting(st: PgState, retryable: Bool, op: (Conn) -> PgReply / Ffi) : (PgState, PgReply) / Ffi =
   match st.conn {
-    None -> if st.reconnect {
+    None -> {
       # No connection: a previous attempt failed. Try to get one back.
       let next = reopen(st)
-      match next.conn {
-        None -> (next, PgErr("", "no connection: connect failed"))
-        Some(conn) -> (next, op(conn))
-      }
-    } else {
-      (st, PgErr("", "no connection: connect failed"))
+      (next, with_conn(next.conn, op))
     }
     Some(conn) -> {
       let reply = op(conn)
-      if st.reconnect and lost_connection(reply) {
-        let next = reopen(st)
-        match next.conn {
-          None -> (next, PgErr("08006", "connection lost; reconnect failed"))
-          Some(fresh) -> if retryable {
-            (next, op(fresh))
-          } else {
-            (next, PgErr("08006", "connection lost; reconnected, statement not retried"))
-          }
-        }
+      if lost_connection(reply) {
+        after_loss(reopen(st), retryable, op)
       } else {
         (st, reply)
       }
+    }
+  }
+
+# The reply for a statement whose connection dropped under it, given
+# the state the reconnect attempt left. This is the only place a
+# statement runs a second time, and only a `retryable` one does.
+fn after_loss(next: PgState, retryable: Bool, op: (Conn) -> PgReply / Ffi) : (PgState, PgReply) / Ffi =
+  match next.conn {
+    None -> (next, PgErr("08006", "connection lost; reconnect failed"))
+    Some(fresh) -> if retryable {
+      (next, op(fresh))
+    } else {
+      (next, PgErr("08006", "connection lost; reconnected, statement not retried"))
     }
   }
 
