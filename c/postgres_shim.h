@@ -24,6 +24,7 @@ int         kai_pg_params_push_null(int64_t conn_handle);
 int         kai_pg_params_count(int64_t conn_handle);
 
 int64_t     kai_pg_exec_params(int64_t conn_handle, const char *sql);
+int         kai_pg_results_live(void);
 
 int         kai_pg_result_status(int64_t res_handle);
 const char *kai_pg_result_error_message(int64_t res_handle);

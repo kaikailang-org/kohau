@@ -238,6 +238,8 @@ extern "C" fn kai_pg_get_is_null(r: Int, row: I32, col: I32) : I32 / Ffi
 
 extern "C" fn kai_pg_clear(r: Int) : I32 / Ffi
 
+extern "C" fn kai_pg_results_live() : I32 / Ffi
+
 # Status of the executed statement: `PGRES_COMMAND_OK` (success, no
 # rows), `PGRES_TUPLES_OK` (success, rows available), or another value
 # for failure.
@@ -300,3 +302,8 @@ pub fn get_is_null(r: Res, row: Int, col: Int) : Bool / Ffi = kai_pg_get_is_null
 # matched by one `clear`; the handle must not be used after.
 #[unstable]
 pub fn clear(r: Res) : Int / Ffi = kai_pg_clear(r.raw)
+
+# Results `exec` handed out that are not yet cleared, across every
+# connection in the process. Zero once each `Some(res)` has met its
+# `clear`; for checking that nothing is left behind.
+pub(pkg) fn live_results() : Int / Ffi = kai_pg_results_live()
