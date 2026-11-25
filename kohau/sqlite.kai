@@ -307,6 +307,8 @@ extern "C" fn kai_sqlite_last_insert_rowid(h: Int) : Int / Ffi
 
 extern "C" fn kai_sqlite_changes(h: Int) : I32 / Ffi
 
+extern "C" fn kai_sqlite_total_changes(h: Int) : Int / Ffi
+
 extern "C" fn kai_sqlite_errmsg(h: Int) : String / Ffi
 
 extern "C" fn kai_sqlite_errcode(h: Int) : I32 / Ffi
@@ -319,9 +321,16 @@ extern "C" fn kai_sqlite_extended_errcode(h: Int) : I32 / Ffi
 pub fn last_insert_rowid(h: Db) : Int / Ffi = kai_sqlite_last_insert_rowid(h.raw)
 
 # Number of rows changed by the most recent INSERT / UPDATE /
-# DELETE on this connection.
+# DELETE on this connection. Any other statement leaves it alone, so
+# after DDL or a pragma it still holds the last DML statement's count.
 #[unstable]
 pub fn changes(h: Db) : Int / Ffi = kai_sqlite_changes(h.raw)
+
+# Rows changed by every INSERT / UPDATE / DELETE since the connection
+# opened, trigger changes included. A statement that changes nothing
+# leaves it unchanged, which is what `changes` cannot tell apart.
+#[unstable]
+pub fn total_changes(h: Db) : Int / Ffi = kai_sqlite_total_changes(h.raw)
 
 # Human-readable error message from the most recent failed call
 # on this connection. Returns the empty string when no error.

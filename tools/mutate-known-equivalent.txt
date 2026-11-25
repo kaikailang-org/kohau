@@ -11,7 +11,7 @@ kohau/sqlite/client_cache.kai:90:call  # cache_take: a cached statement is alway
 
 kohau/sqlite/client_cell.kai:65:call  # with_stmt: on the bind-failure path the statement has not been stepped since cache_take reset it, so the reset is a no-op. The bindings it leaves are cleared by cache_take on the next hit.
 
-kohau/sqlite/client_cell.kai:176:literal  # close_conn: the result for a cell with no connection is discarded by the Shutdown arm, its only caller.
+kohau/sqlite/client_cell.kai:194:literal  # close_conn: the result for a cell with no connection is discarded by the Shutdown arm, its only caller.
 
 kohau/sqlite/client.kai:338:literal  # set_wal: the result for a missing connection is discarded by with_client, its only caller; the journal mode switch is advisory.
 

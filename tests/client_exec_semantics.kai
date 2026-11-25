@@ -1,0 +1,83 @@
+# tests/client_exec_semantics.kai — what `exec` does with a statement
+# that returns rows, and what its changes count means after statements
+# that are not INSERT / UPDATE / DELETE.
+
+import actor
+
+import kohau.sqlite.client
+
+fn show_exec(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
+  Ok(changed) -> Stdout.print(label ++ (": ok changes=" ++ int_to_string(changed)))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
+}
+
+fn render_row(cols: [String]) : String = match cols {
+  [] -> ""
+  [x] -> x
+  [x, ...rest] -> x ++ ("," ++ render_row(rest))
+}
+
+fn render_rows(rows: [[String]]) : String = match rows {
+  [] -> ""
+  [r] -> "[" ++ (render_row(r) ++ "]")
+  [r, ...rest] -> "[" ++ (render_row(r) ++ ("] " ++ render_rows(rest)))
+}
+
+fn show_rows(label: String, r: Result[[[String]], SqliteError]) : Unit / Console = match r {
+  Ok(rows) -> Stdout.print(label ++ (": " ++ render_rows(rows)))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
+}
+
+fn show_compiled(label: String, r: Result[(Int, Int), SqliteError]) : Unit / Console = match r {
+  Ok((compiled, _)) -> Stdout.print(label ++ (": compiled=" ++ int_to_string(compiled)))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
+}
+
+fn rows_returned(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  show_exec("pragma busy_timeout set", client.exec(c, "PRAGMA busy_timeout = 2000", []))
+  show_rows("pragma busy_timeout read", client.query_rows(c, "PRAGMA busy_timeout", []))
+  show_exec("pragma user_version set", client.exec(c, "PRAGMA user_version = 7", []))
+  show_rows("pragma user_version read", client.query_rows(c, "PRAGMA user_version", []))
+  show_exec("pragma quick_check", client.exec(c, "PRAGMA quick_check", []))
+  let three = "WITH c(x) AS (VALUES (1), (2), (3)) SELECT x FROM c"
+  show_exec("exec three-row select", client.exec(c, three, []))
+  show_compiled("after exec", client.cache_stats(c))
+  # The cached statement was reset: the same SQL runs again from the
+  # start, without a second compilation.
+  show_rows("same select as query", client.query_rows(c, three, []))
+  show_compiled("after query", client.cache_stats(c))
+  # A failure after the first row is still a failure.
+  show_exec("error on second row", client.exec(c, "WITH c(x) AS (VALUES (1), (2)) SELECT CASE WHEN x = 2 THEN abs(-9223372036854775808) ELSE x END FROM c", []))
+}
+
+fn changes_count(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  show_exec("create t", client.exec(c, "CREATE TABLE t (x INTEGER)", []))
+  show_exec("insert three", client.exec(c, "INSERT INTO t VALUES (1), (2), (3)", []))
+  show_exec("create table after insert", client.exec(c, "CREATE TABLE u (x INTEGER)", []))
+  show_exec("create index after insert", client.exec(c, "CREATE INDEX t_x ON t (x)", []))
+  show_exec("pragma after insert", client.exec(c, "PRAGMA user_version = 8", []))
+  show_exec("begin", client.exec(c, "BEGIN", []))
+  show_exec("commit", client.exec(c, "COMMIT", []))
+  show_exec("update none", client.exec(c, "UPDATE t SET x = 0 WHERE x > 100", []))
+  show_exec("delete two", client.exec(c, "DELETE FROM t WHERE x <= 2", []))
+  show_exec("insert returning", client.exec(c, "INSERT INTO t VALUES (9) RETURNING x", []))
+  # Rows a trigger changes are not the statement's own.
+  show_exec("create log", client.exec(c, "CREATE TABLE log (x INTEGER)", []))
+  show_exec("create trigger", client.exec(c, "CREATE TRIGGER t_log AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.x); INSERT INTO log VALUES (new.x); END", []))
+  show_exec("insert with trigger", client.exec(c, "INSERT INTO t VALUES (4)", []))
+  show_exec("delete all", client.exec(c, "DELETE FROM t", []))
+  show_exec("drop after delete", client.exec(c, "DROP TABLE u", []))
+}
+
+fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+  rows_returned(c)
+  changes_count(c)
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  with_mailbox(() => {
+    client.with_client(":memory:", body)
+  })
+  0
+}

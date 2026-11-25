@@ -40,6 +40,7 @@ int         kai_sqlite_reset(int64_t stmt_handle);
 int         kai_sqlite_finalize(int64_t stmt_handle);
 int64_t     kai_sqlite_last_insert_rowid(int64_t handle);
 int         kai_sqlite_changes(int64_t handle);
+int64_t     kai_sqlite_total_changes(int64_t handle);
 const char *kai_sqlite_errmsg(int64_t handle);
 int         kai_sqlite_errcode(int64_t handle);
 int         kai_sqlite_extended_errcode(int64_t handle);

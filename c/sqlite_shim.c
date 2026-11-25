@@ -299,6 +299,17 @@ int kai_sqlite_changes(int64_t handle) {
     return sqlite3_changes((sqlite3 *)(intptr_t)handle);
 }
 
+// Rows changed by every INSERT / UPDATE / DELETE since the connection
+// opened, trigger changes included. Unlike `changes`, a statement that
+// changes nothing leaves it where it was.
+int64_t kai_sqlite_total_changes(int64_t handle) {
+#if SQLITE_VERSION_NUMBER >= 3037000
+    return (int64_t)sqlite3_total_changes64((sqlite3 *)(intptr_t)handle);
+#else
+    return (int64_t)sqlite3_total_changes((sqlite3 *)(intptr_t)handle);
+#endif
+}
+
 // Human-readable error message from the most recent failed call on
 // this connection. Returns a pointer into sqlite's internal buffer;
 // valid until the next operation on the connection.
