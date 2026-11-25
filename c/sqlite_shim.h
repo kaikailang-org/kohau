@@ -44,5 +44,7 @@ int64_t     kai_sqlite_total_changes(int64_t handle);
 const char *kai_sqlite_errmsg(int64_t handle);
 int         kai_sqlite_errcode(int64_t handle);
 int         kai_sqlite_extended_errcode(int64_t handle);
+void        kai_sqlite_interrupt(int64_t handle);
+int         kai_sqlite_set_progress_limit(int64_t handle, int64_t n_steps);
 
 #endif
