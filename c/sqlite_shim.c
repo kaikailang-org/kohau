@@ -33,6 +33,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Progress-handler ticks since the current call into the VM began.
+// SQLite's own instruction counter keeps growing across resets, so a
+// cached statement would trip a limit after enough short runs; this
+// one restarts on every step, exec and prepare. Thread-local because
+// the handler runs on the thread that called in.
+static __thread uint64_t kai_progress_ticks;
+
 // ---- lifecycle ----
 
 // Open (or create) the database at `path`. The string ":memory:"
@@ -62,6 +69,7 @@ int kai_sqlite_close(int64_t handle) {
 // SQLITE_OK on success.
 int kai_sqlite_exec(int64_t handle, const char *sql) {
     sqlite3 *db = (sqlite3 *)(intptr_t)handle;
+    kai_progress_ticks = 0;
     return sqlite3_exec(db, sql, NULL, NULL, NULL);
 }
 
@@ -72,6 +80,7 @@ int kai_sqlite_exec(int64_t handle, const char *sql) {
 int64_t kai_sqlite_prepare(int64_t handle, const char *sql) {
     sqlite3 *db = (sqlite3 *)(intptr_t)handle;
     sqlite3_stmt *stmt = NULL;
+    kai_progress_ticks = 0;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         if (stmt) sqlite3_finalize(stmt);
@@ -169,6 +178,7 @@ int kai_sqlite_clear_bindings(int64_t stmt_handle) {
 //   - SQLITE_DONE (101): no more rows
 //   - SQLITE_BUSY (5), SQLITE_ERROR (1), etc. on failure
 int kai_sqlite_step(int64_t stmt_handle) {
+    kai_progress_ticks = 0;
     return sqlite3_step((sqlite3_stmt *)(intptr_t)stmt_handle);
 }
 
@@ -334,4 +344,35 @@ int kai_sqlite_errcode(int64_t handle) {
 int kai_sqlite_extended_errcode(int64_t handle) {
     if (handle == 0) return SQLITE_OK;
     return sqlite3_extended_errcode((sqlite3 *)(intptr_t)handle);
+}
+
+// ---- interruption ----
+
+// Make the statement running on this connection return
+// SQLITE_INTERRUPT. Safe to call from another thread while the
+// connection is open; a no-op when nothing is running.
+void kai_sqlite_interrupt(int64_t handle) {
+    if (handle == 0) return;
+    sqlite3_interrupt((sqlite3 *)(intptr_t)handle);
+}
+
+static int kai_progress_abort(void *limit_ticks) {
+    return ++kai_progress_ticks >= (uint64_t)(uintptr_t)limit_ticks;
+}
+
+// Abort any single step, exec or prepare that runs more than about
+// `n_steps` VM instructions, with SQLITE_INTERRUPT. `n_steps <= 0`
+// removes the limit. The handler fires every n/16 instructions, so
+// the cut lands within a sixteenth of `n_steps`.
+int kai_sqlite_set_progress_limit(int64_t handle, int64_t n_steps) {
+    sqlite3 *db = (sqlite3 *)(intptr_t)handle;
+    if (n_steps <= 0) {
+        sqlite3_progress_handler(db, 0, NULL, NULL);
+        return SQLITE_OK;
+    }
+    int64_t period = n_steps >= 16 ? n_steps / 16 : 1;
+    if (period > INT32_MAX) period = INT32_MAX;
+    uint64_t limit_ticks = (uint64_t)((n_steps + period - 1) / period);
+    sqlite3_progress_handler(db, (int)period, kai_progress_abort, (void *)(uintptr_t)limit_ticks);
+    return SQLITE_OK;
 }

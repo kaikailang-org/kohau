@@ -1,0 +1,13 @@
+endless first row: ok
+endless after interrupt: ok
+errcode after interrupt: ok
+usable after interrupt: ok
+grind interrupted from another fiber: ok
+stopped within a second: ok
+usable after cross-fiber interrupt: ok
+grind over the limit: ok
+exec over the limit: ok
+short query rerun 5000 times: ok
+cheap rows past the limit: ok
+grind after removal: ok
+grind count after removal: ok

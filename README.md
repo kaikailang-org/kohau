@@ -32,7 +32,13 @@ edition):
 - **Prepared statements**: `prepare(db, sql) : Option[Stmt]`,
   `bind_text`, `bind_int`, `step`, `column_int`, `column_text`,
   `column_count`, `reset`, `finalize`.
-- **Diagnostics**: `last_insert_rowid`, `changes`, `errmsg`.
+- **Diagnostics**: `last_insert_rowid`, `changes`, `total_changes`,
+  `errmsg`.
+- **Stopping a statement**: `interrupt(db)`, safe from another
+  fiber while one is blocked in `step`, and
+  `set_progress_limit(db, n)`, which fails any single call into
+  SQLite that runs past about `n` VM instructions. Both end the
+  statement with `SQLITE_INTERRUPT` (9).
 
 The constructors return `Option` — open/prepare failure is a typed
 absence, not a `0` sentinel. Status codes follow libsqlite3

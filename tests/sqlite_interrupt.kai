@@ -1,0 +1,151 @@
+# tests/sqlite_interrupt.kai — stopping a running statement, with
+# `interrupt` and with `set_progress_limit`.
+#
+# The concurrent case needs a second worker thread, since the fiber
+# running the query is blocked inside SQLite. Under `KAI_THREADS=1`
+# the grinding query runs to its end and the fixture reports it.
+
+import spawn
+
+import time
+
+import kohau.sqlite
+
+fn check_eq_int(label: String, got: Int, want: Int) : Unit / Stdout = if got == want {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ (": FAIL got=" ++ (int_to_string(got) ++ (" want=" ++ int_to_string(want)))))
+}
+
+fn check_ok(label: String, ok: Bool) : Unit / Stdout = if ok {
+  Stdout.print(label ++ ": ok")
+} else {
+  Stdout.print(label ++ ": FAIL")
+}
+
+# Never ends on its own: one row per step, forever.
+fn endless_sql() : String = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c"
+
+# One step that grinds through `n` rows before it can answer.
+fn grind_sql(n: Int) : String = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < " ++ (int_to_string(n) ++ ") SELECT count(*) FROM c")
+
+# Prepare, step once, finalize. The rc of the step, or -1 when the
+# statement does not compile.
+fn step_once(db: Db, sql: String) : Int / Ffi = match sqlite.prepare(db, sql) {
+  None -> -1
+  Some(stmt) -> {
+    let rc = sqlite.step(stmt)
+    let _ = sqlite.finalize(stmt)
+    rc
+  }
+}
+
+fn still_usable(label: String, db: Db) : Unit / Ffi + Stdout = check_eq_int(label, step_once(db, "SELECT 1"), sqlite.SQLITE_ROW)
+
+fn interrupt_between_rows(db: Db) : Unit / Ffi + Stdout = match sqlite.prepare(db, endless_sql()) {
+  None -> check_ok("prepare endless", false)
+  Some(stmt) -> {
+    check_eq_int("endless first row", sqlite.step(stmt), sqlite.SQLITE_ROW)
+    sqlite.interrupt(db)
+    check_eq_int("endless after interrupt", sqlite.step(stmt), sqlite.SQLITE_INTERRUPT)
+    check_eq_int("errcode after interrupt", sqlite.errcode(db), sqlite.SQLITE_INTERRUPT)
+    let _ = sqlite.finalize(stmt)
+    still_usable("usable after interrupt", db)
+  }
+}
+
+fn interrupt_now_and_then(db: Db, tries: Int) : Unit / Ffi + Clock = if tries > 0 {
+  time.sleep(time.millis(20))
+  sqlite.interrupt(db)
+  interrupt_now_and_then(db, tries - 1)
+} else {
+  ()
+}
+
+# A query blocked in one step on another fiber, stopped from this one.
+# The interrupt repeats because the first may land before the other
+# fiber has started stepping, when it is a no-op.
+fn interrupt_from_another_fiber(db: Db) : Unit / Ffi + Stdout + Spawn + Clock {
+  let start = time.monotonic()
+  let rc = nursery { n ->
+    let f = n.spawn(() => step_once(db, grind_sql(200000000)))
+    interrupt_now_and_then(db, 10)
+    n.await(f)
+  }
+  let took = time.duration_to_nanos(time.elapsed_since(start, time.monotonic()))
+  check_eq_int("grind interrupted from another fiber", rc, sqlite.SQLITE_INTERRUPT)
+  check_ok("stopped within a second", took < 1000000000)
+  still_usable("usable after cross-fiber interrupt", db)
+}
+
+# Run the same compiled statement `n` times; the count of runs that
+# produced their row.
+fn rerun(stmt: Stmt, n: Int, ok: Int) : Int / Ffi = if n == 0 {
+  ok
+} else {
+  let rc = sqlite.step(stmt)
+  let _ = sqlite.reset(stmt)
+  rerun(stmt, n - 1, if rc == sqlite.SQLITE_ROW {
+    ok + 1
+  } else {
+    ok
+  })
+}
+
+fn progress_limit(db: Db) : Unit / Ffi + Stdout {
+  sqlite.set_progress_limit(db, 1000000)
+  check_eq_int("grind over the limit", step_once(db, grind_sql(200000000)), sqlite.SQLITE_INTERRUPT)
+  check_eq_int("exec over the limit", sqlite.exec(db, grind_sql(200000000)), sqlite.SQLITE_INTERRUPT)
+  # Many short runs of one statement add up to far more than the
+  # limit; each run on its own stays well under it.
+  match sqlite.prepare(db, grind_sql(1000)) {
+    None -> check_ok("prepare short", false)
+    Some(stmt) -> {
+      check_eq_int("short query rerun 5000 times", rerun(stmt, 5000, 0), 5000)
+      let _ = sqlite.finalize(stmt)
+      ()
+    }
+  }
+  # Endless, but every step is cheap: a per-step limit never cuts it.
+  match sqlite.prepare(db, endless_sql()) {
+    None -> check_ok("prepare endless", false)
+    Some(stmt) -> {
+      check_eq_int("cheap rows past the limit", rerun_steps(stmt, 300000, 0), 300000)
+      let _ = sqlite.finalize(stmt)
+      ()
+    }
+  }
+  sqlite.set_progress_limit(db, 0)
+  match sqlite.prepare(db, grind_sql(300000)) {
+    None -> check_ok("prepare after removal", false)
+    Some(stmt) -> {
+      check_eq_int("grind after removal", sqlite.step(stmt), sqlite.SQLITE_ROW)
+      check_eq_int("grind count after removal", sqlite.column_int(stmt, 0), 300000)
+      let _ = sqlite.finalize(stmt)
+      ()
+    }
+  }
+}
+
+# Step one statement `n` times without resetting; the count of rows.
+fn rerun_steps(stmt: Stmt, n: Int, rows: Int) : Int / Ffi = if n == 0 {
+  rows
+} else if sqlite.step(stmt) == sqlite.SQLITE_ROW {
+  rerun_steps(stmt, n - 1, rows + 1)
+} else {
+  rows
+}
+
+fn main() : Int / Console + Ffi + Spawn + Clock = match sqlite.open(":memory:") {
+  None -> {
+    check_ok("open", false)
+    1
+  }
+  Some(db) -> {
+    interrupt_between_rows(db)
+    interrupt_from_another_fiber(db)
+    progress_limit(db)
+    let _ = sqlite.close(db)
+    0
+  }
+}

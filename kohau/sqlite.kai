@@ -80,6 +80,10 @@ pub const SQLITE_ROW : Int = 100
 # Step result: no more rows; finalize the statement.
 pub const SQLITE_DONE : Int = 101
 
+# Result code of a statement stopped by `interrupt` or by the limit
+# `set_progress_limit` installs.
+pub const SQLITE_INTERRUPT : Int = 9
+
 # ---- storage classes, as returned by `column_type` ----
 
 # 64-bit signed integer.
@@ -351,3 +355,30 @@ pub fn errcode(h: Db) : Int / Ffi = kai_sqlite_errcode(h.raw)
 # branching on.
 #[unstable]
 pub fn extended_errcode(h: Db) : Int / Ffi = kai_sqlite_extended_errcode(h.raw)
+
+# ---- interruption ----
+
+extern "C" fn kai_sqlite_interrupt(h: Int) : Unit / Ffi
+
+extern "C" fn kai_sqlite_set_progress_limit(h: Int, n_steps: Int) : I32 / Ffi
+
+# Stop the statement running on this connection: its `step` returns
+# `SQLITE_INTERRUPT`, and the connection stays usable. Meant to be
+# called from another fiber while one is blocked in `step`, which
+# needs `KAI_THREADS` above 1. A no-op when nothing is running, so it
+# cannot pre-empt a statement that has not started.
+#[unstable]
+pub fn interrupt(h: Db) : Unit / Ffi = kai_sqlite_interrupt(h.raw)
+
+# Bound the work of each call into SQLite on this connection — every
+# `step`, `exec` and `prepare` — to about `n_vm_steps` virtual machine
+# instructions. A call that runs past it fails with
+# `SQLITE_INTERRUPT`; `0` removes the limit. The bound is per call,
+# not per statement: a scan returning many cheap rows is never cut,
+# only a single step that grinds, such as an aggregate or a sort.
+#[unstable]
+pub fn set_progress_limit(h: Db, n_vm_steps: Int) : Unit / Ffi {
+  let _ = kai_sqlite_set_progress_limit(h.raw, n_vm_steps)
+  ()
+}
+
