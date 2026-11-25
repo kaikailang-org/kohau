@@ -15,14 +15,13 @@
 #   8. query_scalar COUNT(*)    (scalar Int, post-delete)
 #   9. close                    (cell closes the connection, exits)
 #
-# Crucially, `body`'s row is `Actor[SqlMsg] + Console` — there is
+# Crucially, `body`'s row is `Spawn + Console` — there is
 # NO `Ffi` at the call site. The cell is the sole FFI owner. This
 # fixture is the proof that the seal holds end to end.
 #
 # Trace order is deterministic: the in-memory DB resets per run,
 # rows insert in order, COUNT is stable.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -49,8 +48,8 @@ fn first_col(cols: [String]) : String = match cols {
   [x, ...__list_rest_52_12__] -> x
 }
 
-# The body runs entirely in Actor[SqlMsg] + Console — no Ffi.
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+# The body runs entirely in Spawn + Console — no Ffi.
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   # ---- DDL ----
   show_exec("create", client.exec(c, "CREATE TABLE todos (id TEXT PRIMARY KEY, data TEXT NOT NULL)", []))
   # ---- INSERTs (text + text binds) ----
@@ -72,8 +71,6 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

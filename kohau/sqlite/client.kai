@@ -21,10 +21,16 @@
 #      and receive a structured result. They never touch
 #      prepare/step/finalize.
 #   3. **Ffi confinement.** The cell-fiber is the only code that
-#      touches `Ffi`. Callers run in `Actor[SqlMsg]`, not `Ffi`.
-#      This is the load-bearing property for the layers above
-#      kohau: henua's `SqliteRepository` drops `/ Ffi` from its
-#      operations and carries only `/ Actor[SqlMsg]`.
+#      touches `Ffi`. Callers run in `Spawn`, not `Ffi`. This is the
+#      load-bearing property for the layers above kohau: henua's
+#      `SqliteRepository` drops `/ Ffi` from its operations.
+#
+# ## Replies do not use the caller's mailbox
+#
+# Each call spawns a one-shot fiber with a mailbox of its own, typed
+# `SqlReply`; the request carries that fiber's pid, and the cell
+# answers there. So a caller needs no mailbox at all, and an actor
+# whose mailbox takes its own message type can use the client.
 #
 # ## Why `with_client(path, body)` and not `connect(path) : Pid`
 #
@@ -117,13 +123,12 @@
 #     inside `with_tx`. Reading a table while writing to it is
 #     defined but rarely what a caller means; bracket the scan when
 #     it needs a stable view.
-#   - **No restart-on-failure yet.** `with_client` spawns a bare
-#     cell. Wrapping it in ahu's `restartable_cell` so a crashed
-#     connection respawns is the next lane (it needs a reconnection
-#     story: re-`open` resets the handle, but in-flight prepared
-#     statements and any open transaction are lost — a real design
-#     question, not a wrapper). kohau's Postgres client has the
-#     first version of this in `with_reconnecting_client`.
+#   - **No restart-on-failure.** `with_client` spawns a bare cell;
+#     if it dies, calls on its pid park forever. Re-`open` would
+#     lose the prepared statements and any open transaction, so a
+#     restart needs a story for calls in flight, not a wrapper.
+#     kohau's Postgres client reconnects a dropped connection in
+#     `with_reconnecting_client`.
 #   - **No connection pool.** One connection per cell.
 #
 # ## Stability
@@ -136,7 +141,7 @@
 
 import actor
 
-import ahu.cell
+import spawn
 
 import kohau.sqlite
 
@@ -179,7 +184,7 @@ pub type Bind
 #[unstable]
 pub type SqliteError = { code: Int, extended: Int, message: String }
 
-# The reply payload. **Carries no `Pid`** — this is load-bearing.
+# What the cell answers. **Carries no `Pid`** — this is load-bearing.
 # kaikai's region-brand walker forbids a value containing a
 # `Pid[Msg]` from being *returned* out of a function (it could
 # outlive the actor scope that minted the pid). The cell's
@@ -215,32 +220,26 @@ pub type SqlReply
   | Chunk([[String]], Bool)
   | SqlErr(SqliteError)
 
-# The cell's mailbox message type. Mono-mailbox: kaikai's
-# `Actor.send : Pid[T] -> T` ties the reply target's type to the
-# active handler's Msg, so the reply travels back on the same
-# mailbox as the request — wrapped in the `Reply` variant. The
-# request variants carry the reply pid; `Reply` carries the pid-free
-# `SqlReply`. Callers never construct or match these directly — the
-# typed helpers below do that.
+# The cell's mailbox message type. A request carries the pid its
+# `SqlReply` goes to. Callers never construct or match these
+# directly — the typed helpers below do that.
 #
-#   Exec(sql, binds, reply)        — no-row statement
+#   Exec(sql, binds, reply)        — statement run for its effect
 #   QueryRow(sql, binds, reply)    — ≤1-row statement
 #   QueryRows(sql, binds, reply)   — multi-row statement
 #   QueryScalar(sql, binds, reply) — single-Int-column statement
 #   Shutdown                       — close the connection, exit
-#   Reply(payload)                 — a reply sent back to a caller
 #[unstable]
 pub type SqlMsg
-  = Exec(String, [Bind], Pid[SqlMsg])
-  | QueryRow(String, [Bind], Pid[SqlMsg])
-  | QueryRows(String, [Bind], Pid[SqlMsg])
-  | QueryScalar(String, [Bind], Pid[SqlMsg])
-  | CacheStats(Pid[SqlMsg])
-  | CursorOpen(String, [Bind], Pid[SqlMsg])
-  | CursorFetch(Int, Int, Pid[SqlMsg])
+  = Exec(String, [Bind], Pid[SqlReply])
+  | QueryRow(String, [Bind], Pid[SqlReply])
+  | QueryRows(String, [Bind], Pid[SqlReply])
+  | QueryScalar(String, [Bind], Pid[SqlReply])
+  | CacheStats(Pid[SqlReply])
+  | CursorOpen(String, [Bind], Pid[SqlReply])
+  | CursorFetch(Int, Int, Pid[SqlReply])
   | CursorClose(Int)
   | Shutdown
-  | Reply(SqlReply)
 
 # ---- errors ----
 
@@ -290,12 +289,10 @@ pub fn error_to_string(e: SqliteError) : String = if e.code == 0 {
 # The effect rows are the load-bearing part of this signature:
 #
 #   - `with_client`'s row carries `Ffi` (it opens the connection and
-#     spawns the FFI-touching loop) and `Spawn` (it spawns the cell)
-#     and `Actor[SqlMsg]` (the caller's mailbox the helpers use).
-#   - `body`'s row is `Actor[SqlMsg] + e` — **no `Ffi`**. The cell
-#     is the sole owner of the FFI boundary. This is what lets henua
-#     run its repository operations in `Actor[SqlMsg]` instead of
-#     `Ffi`.
+#     spawns the FFI-touching loop) and `Spawn` (it spawns the cell,
+#     and every helper spawns its reply fiber).
+#   - `body`'s row is `Spawn + e` — **no `Ffi`**, and no mailbox. The
+#     cell is the sole owner of the FFI boundary.
 #
 # The `+ e` on body lets callers thread their own effects (Console
 # for tracing, etc.) without `with_client` having to know about them.
@@ -323,7 +320,7 @@ pub fn error_to_string(e: SqliteError) : String = if e.code == 0 {
 # a different mode issues `PRAGMA journal_mode = ...` through
 # `exec` and it wins.
 #[unstable]
-pub fn with_client[r, e](path: String, body: (Pid[SqlMsg]) -> r / Actor[SqlMsg] + e) : r / Spawn + Ffi + Actor[SqlMsg] + e {
+pub fn with_client[r, e](path: String, body: (Pid[SqlMsg]) -> r / Spawn + e) : r / Spawn + Ffi + e {
   let db = sqlite.open(path)
   let _ = set_wal(db)
   let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty(), cursors: [], next_id: 1 }))
@@ -338,24 +335,27 @@ fn set_wal(db: Option[Db]) : Int / Ffi = match db {
   None -> 0
 }
 
-# Unwrap a mailbox message into its reply payload. `cell.ask`
-# returns *any* `SqlMsg` (the mailbox can in principle hold a stray
-# request), so the helpers first peel the `Reply` wrapper. A
-# non-`Reply` message is a protocol violation — it means something
-# other than this cell sent to the caller's mailbox between the ask
-# and the receive. We surface it as `SqlErr` rather than guess.
-fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
-  Reply(payload) -> payload
-  Exec(_, _, _) -> SqlErr(local_error("protocol: stray Exec on reply mailbox"))
-  QueryRow(_, _, _) -> SqlErr(local_error("protocol: stray QueryRow on reply mailbox"))
-  QueryRows(_, _, _) -> SqlErr(local_error("protocol: stray QueryRows on reply mailbox"))
-  QueryScalar(_, _, _) -> SqlErr(local_error("protocol: stray QueryScalar on reply mailbox"))
-  CacheStats(_) -> SqlErr(local_error("protocol: stray CacheStats on reply mailbox"))
-  CursorOpen(_, _, _) -> SqlErr(local_error("protocol: stray CursorOpen on reply mailbox"))
-  CursorFetch(_, _, _) -> SqlErr(local_error("protocol: stray CursorFetch on reply mailbox"))
-  CursorClose(_) -> SqlErr(local_error("protocol: stray CursorClose on reply mailbox"))
-  Shutdown -> SqlErr(local_error("protocol: stray Shutdown on reply mailbox"))
+# Send the request `build` makes and wait for its reply, on a
+# one-shot fiber whose mailbox takes only `SqlReply`. That mailbox's
+# pid is known to the cell alone, so nothing else can land there.
+fn call(c: Pid[SqlMsg], build: (Pid[SqlReply]) -> SqlMsg) : SqlReply / Spawn = nursery { k ->
+  let f = k.spawn(() => with_mailbox(() => {
+    Actor.send(c, build(Actor.self()))
+    receive_reply()
+  }))
+  k.await(f)
 }
+
+fn receive_reply() : SqlReply / Actor[SqlReply] = Actor.receive()
+
+# Send a request that gets no reply, from a caller that need not have
+# a mailbox.
+fn tell(c: Pid[SqlMsg], msg: SqlMsg) : Unit / Spawn = nursery { k ->
+  let f = k.spawn(() => with_mailbox(() => send_only(c, msg)))
+  k.await(f)
+}
+
+fn send_only(c: Pid[SqlMsg], msg: SqlMsg) : Unit / Actor[SqlReply] = Actor.send(c, msg)
 
 # Run a statement for its effect (DDL, INSERT, DELETE, UPDATE,
 # BEGIN/COMMIT, pragmas). Rows it returns are stepped through and
@@ -363,11 +363,10 @@ fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
 # answers with a row. Returns `Ok(changes)` — the rows the statement
 # itself changed, not counting trigger changes, and `0` for anything
 # but INSERT / UPDATE / DELETE — or `Err(e)` on a SQLite failure.
-# Lives in `Actor[SqlMsg]` — no `Ffi` at the call site.
+# No `Ffi` at the call site, and no mailbox needed.
 #[unstable]
-pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => Exec(sql, binds, me))
-  match expect_reply(reply) {
+pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteError] / Spawn {
+  match call(c, me => Exec(sql, binds, me)) {
     ExecOk(changed) -> Ok(changed)
     SqlErr(msg) -> Err(msg)
     RowFound(_) -> 
@@ -387,9 +386,8 @@ pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteErro
 # or `Err(msg)` on a SQLite failure. v1 reads a single TEXT column
 # (the `find`-by-key shape); the returned list has length 1 on a hit.
 #[unstable]
-pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[String]], SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => QueryRow(sql, binds, me))
-  match expect_reply(reply) {
+pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[String]], SqliteError] / Spawn {
+  match call(c, me => QueryRow(sql, binds, me)) {
     RowFound(cols) -> Ok(Some(cols))
     RowAbsent -> Ok(None)
     SqlErr(msg) -> Err(msg)
@@ -415,9 +413,8 @@ pub fn query_row(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Option[[St
 # A streaming / chunked protocol (or an ahu `Stream` source) for
 # unbounded scans is a follow-up — see `docs/design.md`.
 #[unstable]
-pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]], SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => QueryRows(sql, binds, me))
-  match expect_reply(reply) {
+pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]], SqliteError] / Spawn {
+  match call(c, me => QueryRows(sql, binds, me)) {
     RowsFound(rows) -> Ok(rows)
     SqlErr(msg) -> Err(msg)
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to QueryRows"))
@@ -433,9 +430,8 @@ pub fn query_rows(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[[[String]
 # Run a single-Int-column query (COUNT, MAX, scalar SELECT).
 # Returns `Ok(n)` or `Err(msg)`.
 #[unstable]
-pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => QueryScalar(sql, binds, me))
-  match expect_reply(reply) {
+pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteError] / Spawn {
+  match call(c, me => QueryScalar(sql, binds, me)) {
     ScalarInt(n) -> Ok(n)
     SqlErr(msg) -> Err(msg)
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to QueryScalar"))
@@ -460,9 +456,8 @@ pub fn query_scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, Sq
 # others — which is also the shape that invites injection. Bind
 # values instead.
 #[unstable]
-pub fn cache_stats(c: Pid[SqlMsg]) : Result[(Int, Int), SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => CacheStats(me))
-  match expect_reply(reply) {
+pub fn cache_stats(c: Pid[SqlMsg]) : Result[(Int, Int), SqliteError] / Spawn {
+  match call(c, me => CacheStats(me)) {
     CacheInfo(compiled, held) -> Ok((compiled, held))
     SqlErr(e) -> Err(e)
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CacheStats"))
@@ -491,9 +486,8 @@ pub type Cursor = { id: Int }
 # starting point; reach for this when the consumer needs to decide
 # mid-scan whether to keep going.
 #[unstable]
-pub fn open_cursor(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Cursor, SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => CursorOpen(sql, binds, me))
-  match expect_reply(reply) {
+pub fn open_cursor(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Cursor, SqliteError] / Spawn {
+  match call(c, me => CursorOpen(sql, binds, me)) {
     CursorReady(id) -> Ok(Cursor { id: id })
     SqlErr(e) -> Err(e)
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CursorOpen"))
@@ -513,9 +507,8 @@ pub fn open_cursor(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Cursor, 
 # A short chunk does **not** mean the end: a chunk can be short only
 # when the rows ran out, but the flag is the signal to trust.
 #[unstable]
-pub fn fetch_chunk(c: Pid[SqlMsg], cur: Cursor, max_rows: Int) : Result[([[String]], Bool), SqliteError] / Actor[SqlMsg] {
-  let reply = cell.ask(c, me => CursorFetch(cur.id, max_rows, me))
-  match expect_reply(reply) {
+pub fn fetch_chunk(c: Pid[SqlMsg], cur: Cursor, max_rows: Int) : Result[([[String]], Bool), SqliteError] / Spawn {
+  match call(c, me => CursorFetch(cur.id, max_rows, me)) {
     Chunk(rows, done) -> Ok((rows, done))
     SqlErr(e) -> Err(e)
     ExecOk(_) -> Err(local_error("protocol: ExecOk reply to CursorFetch"))
@@ -532,7 +525,7 @@ pub fn fetch_chunk(c: Pid[SqlMsg], cur: Cursor, max_rows: Int) : Result[([[Strin
 # a cursor that already finished — a consumer that stops early does
 # not have to know whether it happened to land on the last chunk.
 #[unstable]
-pub fn close_cursor(c: Pid[SqlMsg], cur: Cursor) : Unit / Actor[SqlMsg] = Actor.send(c, CursorClose(cur.id))
+pub fn close_cursor(c: Pid[SqlMsg], cur: Cursor) : Unit / Spawn = tell(c, CursorClose(cur.id))
 
 # Fold `step` over a result set, `chunk_size` rows at a time, never
 # holding more than one chunk in memory. This is the streaming
@@ -549,7 +542,7 @@ pub fn close_cursor(c: Pid[SqlMsg], cur: Cursor) : Unit / Actor[SqlMsg] = Actor.
 #   FoldMore(sum + sum_first_column(rows)))
 # ```
 #[unstable]
-pub fn fold_chunks[a, e](c: Pid[SqlMsg], sql: String, binds: [Bind], chunk_size: Int, init: a, step: (a, [[String]]) -> FoldStep[a] / Actor[SqlMsg] + e) : Result[a, SqliteError] / Actor[SqlMsg] + e = match open_cursor(c, sql, binds) {
+pub fn fold_chunks[a, e](c: Pid[SqlMsg], sql: String, binds: [Bind], chunk_size: Int, init: a, step: (a, [[String]]) -> FoldStep[a] / Spawn + e) : Result[a, SqliteError] / Spawn + e = match open_cursor(c, sql, binds) {
   Err(e) -> Err(e)
   Ok(cur) -> fold_loop(c, cur, chunk_size, init, step)
 }
@@ -563,7 +556,7 @@ pub type FoldStep[a]
 # Drive the cursor until the result set ends, `step` stops, or a
 # fetch fails. Closes the cursor on the two paths where the cell has
 # not already dropped it.
-fn fold_loop[a, e](c: Pid[SqlMsg], cur: Cursor, chunk_size: Int, acc: a, step: (a, [[String]]) -> FoldStep[a] / Actor[SqlMsg] + e) : Result[a, SqliteError] / Actor[SqlMsg] + e = match fetch_chunk(c, cur, chunk_size) {
+fn fold_loop[a, e](c: Pid[SqlMsg], cur: Cursor, chunk_size: Int, acc: a, step: (a, [[String]]) -> FoldStep[a] / Spawn + e) : Result[a, SqliteError] / Spawn + e = match fetch_chunk(c, cur, chunk_size) {
   # A failed fetch has already finalized the cursor cell-side.
   Err(e) -> Err(e)
   Ok((rows, done)) -> match step(acc, rows) {
@@ -591,7 +584,7 @@ fn fold_loop[a, e](c: Pid[SqlMsg], cur: Cursor, chunk_size: Int, acc: a, step: (
 # body. After `close`, the client pid is dead; further helper calls
 # park forever on a reply that never comes.
 #[unstable]
-pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] = Actor.send(c, Shutdown)
+pub fn close(c: Pid[SqlMsg]) : Unit / Spawn = tell(c, Shutdown)
 
 # Run `body` inside a transaction scope. `BEGIN` on entry; `COMMIT`
 # if `body` returns `Ok`, `ROLLBACK` if it returns `Err`. The result
@@ -644,7 +637,7 @@ pub fn close(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] = Actor.send(c, Shutdown)
 #     case; the cell's per-op statement isolation limits the blast
 #     radius.
 #[unstable]
-pub fn with_tx[r, e](c: Pid[SqlMsg], body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Actor[SqlMsg] + e) : Result[r, SqliteError] / Actor[SqlMsg] + e = with_tx_mode(c, Deferred, body)
+pub fn with_tx[r, e](c: Pid[SqlMsg], body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Spawn + e) : Result[r, SqliteError] / Spawn + e = with_tx_mode(c, Deferred, body)
 
 # Locking mode for a transaction scope, as the `BEGIN` variant it
 # emits. SQLite takes locks lazily by default, which is the right
@@ -689,7 +682,7 @@ fn prefixed(e: SqliteError, prefix: String) : SqliteError = SqliteError {
 # `with_tx` with an explicit locking mode — see `TxMode`. Identical
 # in every other respect, including the v1 limitations above.
 #[unstable]
-pub fn with_tx_mode[r, e](c: Pid[SqlMsg], mode: TxMode, body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Actor[SqlMsg] + e) : Result[r, SqliteError] / Actor[SqlMsg] + e = match exec(c, begin_sql(mode), []) {
+pub fn with_tx_mode[r, e](c: Pid[SqlMsg], mode: TxMode, body: (Pid[SqlMsg]) -> Result[r, SqliteError] / Spawn + e) : Result[r, SqliteError] / Spawn + e = match exec(c, begin_sql(mode), []) {
   Err(e) -> Err(prefixed(e, "BEGIN failed"))
   Ok(_) -> {
     let result = body(c)

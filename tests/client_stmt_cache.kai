@@ -20,7 +20,6 @@
 # Compile counts are exact, not bounds: a change in what the cache
 # keys on should break this fixture loudly.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -29,25 +28,25 @@ fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ (": "
 fn show_int(label: String, n: Int) : Unit / Console = show(label, int_to_string(n))
 
 # Compilations so far, or -1 if the cell could not answer.
-fn compiled(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.cache_stats(c) {
+fn compiled(c: Pid[SqlMsg]) : Int / Spawn = match client.cache_stats(c) {
   Ok((n, _)) -> n
   Err(_) -> -1
 }
 
 # Statements currently held.
-fn held(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.cache_stats(c) {
+fn held(c: Pid[SqlMsg]) : Int / Spawn = match client.cache_stats(c) {
   Ok((_, n)) -> n
   Err(_) -> -1
 }
 
-fn scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Int / Actor[SqlMsg] = match client.query_scalar(c, sql, binds) {
+fn scalar(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Int / Spawn = match client.query_scalar(c, sql, binds) {
   Ok(n) -> n
   Err(_) -> -1
 }
 
 # Run the same parameterised insert `n` times, with a different
 # value each time.
-fn insert_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+fn insert_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Spawn = if i > n {
   ()
 } else {
   let _ = client.exec(c, "INSERT INTO t (id) VALUES (?)", [BindInt(i)])
@@ -56,14 +55,14 @@ fn insert_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
 
 # Run `n` *distinct* statements, to push the cache past capacity.
 # Each selects a different literal, so each is its own cache key.
-fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Spawn = if i > n {
   ()
 } else {
   let _ = client.query_scalar(c, "SELECT " ++ int_to_string(i), [])
   distinct_n(c, i + 1, n)
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   # ---- 0. a fresh cache ----
   show_int("compiled at start", compiled(c))
   show_int("held at start", held(c))
@@ -132,8 +131,6 @@ fn join(xs: [String], sep: String) : String = match xs {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

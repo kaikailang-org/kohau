@@ -4,7 +4,7 @@
 # the mailbox as cleanly as it carries successes. This fixture
 # drives the `SqlErr` path of every helper and confirms the error
 # message surfaces as `Err(msg)` at the caller — still in
-# `Actor[SqlMsg]`, no `Ffi`.
+# `Spawn`, no `Ffi`, no mailbox.
 #
 # Cases:
 #   1. exec of malformed DDL            -> Err (SQLite parse error)
@@ -19,7 +19,6 @@
 # in one leaves the connection usable for the next. This is the
 # liveness property that makes the cell safe to keep open.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -41,7 +40,7 @@ fn show_row(label: String, r: Result[Option[[String]], SqliteError]) : Unit / Co
 # We print only "err" / "ok" (not the SQLite message text) so the
 # golden stays stable across libsqlite3 versions, whose error
 # strings differ in wording.
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   # 1. malformed DDL
   show_exec("bad ddl", client.exec(c, "CREATE TABL oops (", []))
   # 2. query against a table that does not exist
@@ -55,8 +54,6 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

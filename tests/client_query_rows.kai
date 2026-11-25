@@ -4,7 +4,7 @@
 # `query_rows` returns every result row's TEXT columns as a
 # `[[String]]`, in result-set order, with the column count discovered
 # from the prepared statement (no caller-declared width). Runs in
-# `Actor[SqlMsg]` — no `Ffi`.
+# `Spawn` — no `Ffi`, no mailbox.
 #
 # Cases:
 #   1. Empty table — query_rows returns [] (Ok with zero rows).
@@ -15,7 +15,6 @@
 #
 # Trace is deterministic: `:memory:` fresh per run, ORDER BY id.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -51,12 +50,12 @@ fn join_pipe(cols: [String]) : String = match cols {
   [c, ...rest] -> c ++ ("|" ++ join_pipe(rest))
 }
 
-fn seed(c: Pid[SqlMsg], id: String, data: String) : Unit / Actor[SqlMsg] {
+fn seed(c: Pid[SqlMsg], id: String, data: String) : Unit / Spawn {
   let _ = client.exec(c, "INSERT INTO t (id, data) VALUES (?, ?)", [BindText(id), BindText(data)])
   ()
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   let _ = client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY, data TEXT NOT NULL)", [])
   # ---- 1. empty table ----
   show_rows("empty", client.query_rows(c, "SELECT data FROM t ORDER BY id", []))
@@ -74,8 +73,6 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

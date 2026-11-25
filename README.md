@@ -59,8 +59,10 @@ single connection inside an [ahu](https://github.com/kaikailang-org/ahu)
 cell (a fiber + typed mailbox + recursive step). The cell **owns
 the connection lifecycle** (opens on spawn, closes on `Shutdown`)
 and is the **sole owner of the `Ffi` boundary** — callers run in
-`Actor[SqlMsg]`, never `Ffi`. The scope-based constructor and the
-typed helpers:
+`Spawn`, never `Ffi`, and need no mailbox: each call gets its reply
+on a one-shot fiber of its own, so an actor whose mailbox takes its
+own message type can use the client. The scope-based constructor and
+the typed helpers:
 
 - `with_client(path, body)` — open a connection, spawn the cell,
   call `body` with the client `Pid[SqlMsg]`. Scope-based because

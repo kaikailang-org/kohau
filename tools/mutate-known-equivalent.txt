@@ -13,7 +13,7 @@ kohau/sqlite/client_cell.kai:65:call  # with_stmt: on the bind-failure path the 
 
 kohau/sqlite/client_cell.kai:194:literal  # close_conn: the result for a cell with no connection is discarded by the Shutdown arm, its only caller.
 
-kohau/sqlite/client.kai:338:literal  # set_wal: the result for a missing connection is discarded by with_client, its only caller; the journal mode switch is advisory.
+kohau/sqlite/client.kai:335:literal  # set_wal: the result for a missing connection is discarded by with_client, its only caller; the journal mode switch is advisory.
 
 kohau/postgres.kai:191:call  # exec: the parameter buffer is already empty on entry. kai_pg_exec_params clears it on every path, and exec resets it when push_binds fails, so the leading reset is a no-op.
 

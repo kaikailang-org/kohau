@@ -80,14 +80,14 @@ fn unknown_cursor(id: Int) : SqliteError = local_error("unknown cursor: " ++ int
 # Compile a statement for a cursor, bind it, and register it under a
 # fresh id. Unlike the pooled operations this does not touch the
 # cache: a cursor owns its statement, as the header explains.
-pub(pkg) fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+pub(pkg) fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_to: Pid[SqlReply]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
   None -> {
-    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    Actor.send(reply_to, SqlErr(local_error("no connection: open failed")))
     st
   }
   Some(d) -> match sqlite.prepare(d, sql) {
     None -> {
-      Actor.send(reply_to, Reply(SqlErr(db_error(d, "prepare"))))
+      Actor.send(reply_to, SqlErr(db_error(d, "prepare")))
       st
     }
     Some(stmt) -> {
@@ -95,11 +95,11 @@ pub(pkg) fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_
       if rc_bind != 0 {
         let err = db_error(d, "bind")
         let _ = sqlite.finalize(stmt)
-        Actor.send(reply_to, Reply(SqlErr(err)))
+        Actor.send(reply_to, SqlErr(err))
         st
       } else {
         let cur = LiveCursor { id: st.next_id, stmt: stmt, ncols: sqlite.column_count(stmt) }
-        Actor.send(reply_to, Reply(CursorReady(st.next_id)))
+        Actor.send(reply_to, CursorReady(st.next_id))
         CellState { db: st.db, cache: st.cache, cursors: [cur, ...st.cursors], next_id: st.next_id + 1 }
       }
     }
@@ -110,24 +110,24 @@ pub(pkg) fn handle_cursor_open(st: CellState, sql: String, binds: [Bind], reply_
 # of its result set, or hits an error, is finalized and dropped here
 # — so the common path (read until `end`) needs no explicit close,
 # and a failed cursor cannot be fetched from again.
-pub(pkg) fn handle_cursor_fetch(st: CellState, id: Int, budget: Int, reply_to: Pid[SqlMsg]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+pub(pkg) fn handle_cursor_fetch(st: CellState, id: Int, budget: Int, reply_to: Pid[SqlReply]) : CellState / Actor[SqlMsg] + Ffi = match st.db {
   None -> {
-    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    Actor.send(reply_to, SqlErr(local_error("no connection: open failed")))
     st
   }
   Some(d) -> match cursor_extract(st.cursors, id) {
     None -> {
-      Actor.send(reply_to, Reply(SqlErr(unknown_cursor(id))))
+      Actor.send(reply_to, SqlErr(unknown_cursor(id)))
       st
     }
     Some((cur, rest)) -> match fetch_rows(d, cur, budget, []) {
       Err(e) -> {
         let _ = sqlite.finalize(cur.stmt)
-        Actor.send(reply_to, Reply(SqlErr(e)))
+        Actor.send(reply_to, SqlErr(e))
         CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }
       }
       Ok((rows, done)) -> {
-        Actor.send(reply_to, Reply(Chunk(rows, done)))
+        Actor.send(reply_to, Chunk(rows, done))
         if done {
           let _ = sqlite.finalize(cur.stmt)
           CellState { db: st.db, cache: st.cache, cursors: rest, next_id: st.next_id }

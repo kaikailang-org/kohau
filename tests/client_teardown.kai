@@ -23,7 +23,6 @@
 # The database is a file under build/ (WAL does not apply to
 # `:memory:`), recreated by the fixture on every run.
 
-import actor
 
 import time
 
@@ -44,14 +43,14 @@ fn render_chunk(r: Result[([[String]], Bool), SqliteError]) : String = match r {
 }
 
 # Run `n` distinct statements, enough to push the cache past capacity.
-fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+fn distinct_n(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Spawn = if i > n {
   ()
 } else {
   let _ = client.query_scalar(c, "SELECT " ++ int_to_string(i), [])
   distinct_n(c, i + 1, n)
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   match client.query_row(c, "PRAGMA journal_mode", []) {
     Ok(Some(cols)) -> show("journal mode", join(cols))
     Ok(None) -> show("journal mode", "absent")
@@ -138,9 +137,7 @@ fn wait_released(path: String, tries: Int) : Bool / Ffi + Clock = if released(pa
 
 fn main() : Int / Spawn + Ffi + Console + Clock {
   let path = "build/client_teardown.db"
-  with_mailbox(() => {
-    client.with_client(path, body)
-  })
+  client.with_client(path, body)
   show("connection closed", if wait_released(path, 300) { "yes" } else { "no" })
   0
 }
