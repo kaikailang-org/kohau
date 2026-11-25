@@ -61,8 +61,10 @@ typed helpers:
   kaikai's region-brand walker forbids a `Pid` from escaping the
   scope that minted it (the same constraint that gives ahu's
   `with_cell` its shape).
-- `exec(c, sql, binds)` — no-row statement (DDL, INSERT, DELETE,
-  UPDATE). Returns `Ok(changes)` or `Err(msg)`.
+- `exec(c, sql, binds)` — run a statement for its effect (DDL,
+  INSERT, DELETE, UPDATE, pragmas); any rows it returns are
+  discarded. Returns `Ok(changes)`, `0` for anything but DML, or
+  `Err(e)`.
 - `query_row(c, sql, binds)` — ≤1-row query. Returns
   `Ok(Some(cols))`, `Ok(None)`, or `Err(msg)`.
 - `query_rows(c, sql, binds)` — multi-row query. Returns

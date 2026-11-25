@@ -47,10 +47,10 @@
 # foot-gun. Instead the cell executes *complete, atomic operations*
 # and returns *values*:
 #
-#   - `Exec`        — run a parameterless or value-bound statement
-#                     that returns no rows (DDL, INSERT, DELETE,
-#                     UPDATE, BEGIN/COMMIT). Reply carries the
-#                     SQLite rc and the `changes()` count.
+#   - `Exec`        — run a statement for its effect (DDL, INSERT,
+#                     DELETE, UPDATE, BEGIN/COMMIT, pragmas). Rows it
+#                     returns are discarded. Reply carries the number
+#                     of rows the statement changed.
 #   - `QueryRow`    — run a statement that returns at most one row.
 #                     Reply is the row's columns as `[String]`, or
 #                     "absent". This is exactly what a primary-key
@@ -190,8 +190,8 @@ pub type SqliteError = { code: Int, extended: Int, message: String }
 # sidesteps that entirely and is also cleaner: a request needs a
 # reply target, a reply never does.
 #
-#   ExecOk(changes)  — no-row statement succeeded; `changes` is
-#                      `sqlite.changes()` after the step
+#   ExecOk(changes)  — statement ran to the end; `changes` is the
+#                      rows it changed, 0 for anything but DML
 #   RowFound(cols)   — ≤1-row query hit; the row's TEXT columns
 #   RowAbsent        — ≤1-row query returned no rows
 #   RowsFound(rows)  — multi-row query; every row's TEXT columns,
@@ -357,10 +357,13 @@ fn expect_reply(msg: SqlMsg) : SqlReply = match msg {
   Shutdown -> SqlErr(local_error("protocol: stray Shutdown on reply mailbox"))
 }
 
-# Run a no-row statement (DDL, INSERT, DELETE, UPDATE, BEGIN/COMMIT).
-# Returns `Ok(changes)` — the row count affected — on success, or
-# `Err(msg)` on a SQLite failure. Lives in `Actor[SqlMsg]` — no
-# `Ffi` at the call site.
+# Run a statement for its effect (DDL, INSERT, DELETE, UPDATE,
+# BEGIN/COMMIT, pragmas). Rows it returns are stepped through and
+# discarded, so `PRAGMA busy_timeout = 2000` works here even though it
+# answers with a row. Returns `Ok(changes)` — the rows the statement
+# itself changed, not counting trigger changes, and `0` for anything
+# but INSERT / UPDATE / DELETE — or `Err(e)` on a SQLite failure.
+# Lives in `Actor[SqlMsg]` — no `Ffi` at the call site.
 #[unstable]
 pub fn exec(c: Pid[SqlMsg], sql: String, binds: [Bind]) : Result[Int, SqliteError] / Actor[SqlMsg] {
   let reply = cell.ask(c, me => Exec(sql, binds, me))

@@ -119,8 +119,10 @@ a reply: meaningless to the caller and a lifetime foot-gun. So the
 cell executes **complete, atomic operations** and returns
 **values**:
 
-- `Exec` — a no-row statement (DDL, INSERT, DELETE, UPDATE,
-  BEGIN/COMMIT). Reply carries `sqlite.changes()`.
+- `Exec` — a statement run for its effect (DDL, INSERT, DELETE,
+  UPDATE, BEGIN/COMMIT, pragmas), stepped to the end with its rows
+  discarded. Reply carries the rows it changed: `sqlite.changes()`
+  when `sqlite.total_changes()` moved, `0` otherwise.
 - `QueryRow` — a ≤1-row statement. Reply is the row's TEXT columns
   or "absent". This is the `find`-by-primary-key shape.
 - `QueryRows` — a multi-row statement. Reply is every row's TEXT

@@ -72,18 +72,36 @@ fn with_stmt(cache: StmtCache, db: Db, sql: String, binds: [Bind], k: (Stmt) -> 
   }
 }
 
-# Execute a no-row statement: bind, step once. Atomic — the
-# statement is fully consumed before this returns.
+# Execute a statement for its effect, stepping to the end and
+# discarding any rows it returns, as `sqlite3_exec` does.
+#
+# `changes()` is only set by INSERT / UPDATE / DELETE, so after any
+# other statement it still holds the last DML count. An unmoved
+# `total_changes()` tells the two apart.
 fn run_exec(cache: StmtCache, db: Db, sql: String, binds: [Bind]) : OpResult / Ffi = with_stmt(cache, db, sql, binds, stmt => {
-  let rc_step = sqlite.step(stmt)
-  let changed = sqlite.changes(db)
-  # DONE, not OK, is success for a no-row statement.
+  let before = sqlite.total_changes(db)
+  let rc_step = step_to_end(stmt)
   if rc_step == sqlite.SQLITE_DONE {
-    ExecOk(changed)
+    if sqlite.total_changes(db) == before {
+      ExecOk(0)
+    } else {
+      ExecOk(sqlite.changes(db))
+    }
   } else {
     SqlErr(db_error(db, "step"))
   }
 })
+
+# Step until the statement stops returning rows. Returns the last rc:
+# `SQLITE_DONE`, or the failure that ended it early.
+fn step_to_end(stmt: Stmt) : Int / Ffi {
+  let rc = sqlite.step(stmt)
+  if rc == sqlite.SQLITE_ROW {
+    step_to_end(stmt)
+  } else {
+    rc
+  }
+}
 
 # Execute a ≤1-row statement. The column count is discovered from
 # the prepared statement, the same way `run_query_rows` does it, so

@@ -1,0 +1,25 @@
+pragma busy_timeout set: ok changes=0
+pragma busy_timeout read: [2000]
+pragma user_version set: ok changes=0
+pragma user_version read: [7]
+pragma quick_check: ok changes=0
+exec three-row select: ok changes=0
+after exec: compiled=6
+same select as query: [1] [2] [3]
+after query: compiled=6
+error on second row: ERR step failed: integer overflow [1]
+create t: ok changes=0
+insert three: ok changes=3
+create table after insert: ok changes=0
+create index after insert: ok changes=0
+pragma after insert: ok changes=0
+begin: ok changes=0
+commit: ok changes=0
+update none: ok changes=0
+delete two: ok changes=2
+insert returning: ok changes=1
+create log: ok changes=0
+create trigger: ok changes=0
+insert with trigger: ok changes=1
+delete all: ok changes=3
+drop after delete: ok changes=0
