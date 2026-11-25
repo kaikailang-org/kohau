@@ -17,7 +17,6 @@
 # The error text is fixed by kohau ("no connection: open failed"),
 # not by libsqlite3, so the golden can assert the full message.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -36,7 +35,7 @@ fn show_scalar(label: String, r: Result[Int, SqliteError]) : Unit / Console = ma
   Err(e) -> Stdout.print(label ++ (": err " ++ client.error_to_string(e)))
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   show_exec("exec", client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY)", []))
   show_row("query_row", client.query_row(c, "SELECT data FROM t WHERE id = ?", [BindText("x")]))
   show_scalar("query_scalar", client.query_scalar(c, "SELECT COUNT(*) FROM t", []))
@@ -45,8 +44,6 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client("/nonexistent-kohau-dir/db.sqlite", body)
-  })
+  client.with_client("/nonexistent-kohau-dir/db.sqlite", body)
   0
 }

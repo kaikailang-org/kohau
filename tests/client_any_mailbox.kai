@@ -1,0 +1,70 @@
+# tests/client_any_mailbox.kai — the client from callers whose mailbox
+# is not `SqlMsg`: an actor that receives its own message type, and a
+# fiber with no mailbox at all.
+
+import actor
+
+import spawn
+
+import kohau.sqlite.client
+
+type ArchiveMsg
+  = Fact(String)
+  | Forget(String)
+  | Stop
+
+fn show(label: String, r: Result[Int, SqliteError]) : Unit / Console = match r {
+  Ok(n) -> Stdout.print(label ++ (": ok " ++ int_to_string(n)))
+  Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
+}
+
+fn render(rows: [[String]]) : String = match rows {
+  [] -> ""
+  [[x]] -> x
+  [[x], ...rest] -> x ++ ("," ++ render(rest))
+  [_, ...rest] -> "?" ++ render(rest)
+}
+
+# Its mailbox takes `ArchiveMsg`; every client call in between leaves
+# that mailbox alone, so the next fact is still there to receive.
+fn archive(c: Pid[SqlMsg]) : Unit / Actor[ArchiveMsg] + Spawn + Console = match Actor.receive() {
+  Fact(text) -> {
+    show("archive " ++ text, client.exec(c, "INSERT INTO facts (text) VALUES (?)", [BindText(text)]))
+    archive(c)
+  }
+  Forget(text) -> {
+    show("forget " ++ text, client.exec(c, "DELETE FROM facts WHERE text = ?", [BindText(text)]))
+    archive(c)
+  }
+  Stop -> match client.query_rows(c, "SELECT text FROM facts ORDER BY id", []) {
+    Ok(rows) -> Stdout.print("archive holds: " ++ render(rows))
+    Err(e) -> Stdout.print("archive read: ERR " ++ client.error_to_string(e))
+  }
+}
+
+fn queue_and_run(c: Pid[SqlMsg]) : Unit / Actor[ArchiveMsg] + Spawn + Console {
+  let me = Actor.self()
+  Actor.send(me, Fact("a"))
+  Actor.send(me, Fact("b"))
+  Actor.send(me, Forget("a"))
+  Actor.send(me, Fact("c"))
+  Actor.send(me, Stop)
+  archive(c)
+}
+
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
+  show("create", client.exec(c, "CREATE TABLE facts (id INTEGER PRIMARY KEY, text TEXT NOT NULL)", []))
+  with_mailbox(() => queue_and_run(c))
+  # A fiber of its own, with no mailbox.
+  let counted = nursery { n ->
+    let f = n.spawn(() => client.query_scalar(c, "SELECT COUNT(*) FROM facts", []))
+    n.await(f)
+  }
+  show("count from a fiber without a mailbox", counted)
+  client.close(c)
+}
+
+fn main() : Int / Spawn + Ffi + Console {
+  client.with_client(":memory:", body)
+  0
+}

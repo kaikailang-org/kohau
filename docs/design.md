@@ -64,8 +64,7 @@ body)` shape — kohau inherits it.
 
 ### Why the FFI is sealed (and how)
 
-The load-bearing property: callers run in `Actor[SqlMsg]`, **not
-`Ffi`**. The cell-fiber is the sole code that touches libsqlite3.
+The load-bearing property: callers run in `Spawn`, **not `Ffi`**. The cell-fiber is the sole code that touches libsqlite3.
 
 This does not happen automatically. `with_cell` (ahu's
 constructor) shares a single open row variable between its `step`
@@ -80,25 +79,33 @@ the cell loop with `spawn_actor` and a recursive `sql_loop`:
 ```kai
 pub fn with_client[R, e](
   path: String,
-  body: (Pid[SqlMsg]) -> R / Actor[SqlMsg] + e
-) : R / Spawn + Ffi + Actor[SqlMsg] + e = {
+  body: (Pid[SqlMsg]) -> R / Spawn + e
+) : R / Spawn + Ffi + e = {
   let db  = sqlite.open(path)
   let pid = spawn_actor(() => sql_loop(db))   # Ffi lands HERE
-  body(pid)                                    # body sees only Actor[SqlMsg]
+  body(pid)                                    # body sees only Spawn
 }
 ```
 
 `sqlite.open` and the spawned `sql_loop` (which runs the
 FFI-touching step) put `Ffi` in `with_client`'s **own** row. `body`'s
-row is `Actor[SqlMsg] + e` — no `Ffi`. The cell is the membrane.
+row is `Spawn + e` — no `Ffi`. The cell is the membrane.
 
-### The protocol: mono-mailbox, split reply
+### The protocol: requests carry a reply pid of another type
 
-kaikai's `Actor.send : Pid[T] -> T` ties the reply target's type to
-the active handler's `Msg`, so request and reply must travel the
-same mailbox (the constraint ahu documents under `cell.ask`). One
-union, `SqlMsg`, carries the request variants (`Exec`, `QueryRow`,
-`QueryScalar`, `Shutdown`) plus a single `Reply(SqlReply)` wrapper.
+`Actor.send` takes its message type from the destination, so the
+cell, whose mailbox is `SqlMsg`, can answer a `Pid[SqlReply]`. Each
+request variant carries one, and the cell sends the bare `SqlReply`
+there.
+
+The caller does not supply that pid from its own mailbox. Each
+helper spawns a one-shot fiber with an `Actor[SqlReply]` mailbox,
+sends the request with that fiber's pid, receives, and returns the
+reply through `await`. The caller's row is `Spawn`, whatever its
+mailbox, or none: an actor whose mailbox is its own message type
+(henua's repository, daystrom's archive writer) uses the client
+directly. The cost is a fiber per call. The one-shot mailbox's pid
+is known to the cell alone, so no stray message can land in it.
 
 The reply payload is its **own pid-free type**, `SqlReply`
 (`ExecOk` / `RowFound` / `RowAbsent` / `ScalarInt` / `SqlErr`).
@@ -254,7 +261,7 @@ language:
   original cause is the more useful signal.
 
 `with_tx` is built on `exec` (BEGIN/COMMIT/ROLLBACK are no-row
-statements), so it inherits the FFI-sealing and `Actor[SqlMsg]`
+statements), so it inherits the FFI-sealing and mailbox-free
 properties of the rest of the client — no new effect surface.
 
 ## External dependencies on kaikai

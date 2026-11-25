@@ -21,7 +21,6 @@
 # Codes are printed, message text is not: the codes are stable across
 # libsqlite3 versions, the wording is not.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -44,14 +43,14 @@ fn join(xs: [String], sep: String) : String = match xs {
   [x, ...rest] -> x ++ (sep ++ join(rest, sep))
 }
 
-fn count_where(c: Pid[SqlMsg], where_sql: String) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM vals WHERE " ++ where_sql, []) {
+fn count_where(c: Pid[SqlMsg], where_sql: String) : Int / Spawn = match client.query_scalar(c, "SELECT COUNT(*) FROM vals WHERE " ++ where_sql, []) {
   Ok(n) -> n
   Err(_) -> -1
 }
 
 fn show_count(label: String, n: Int) : Unit / Console = Stdout.print(label ++ (": " ++ int_to_string(n)))
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   # ---- 1. branching on the code ----
   let _ = client.exec(c, "CREATE TABLE uniq (id INTEGER PRIMARY KEY)", [])
   show_code("first insert", client.exec(c, "INSERT INTO uniq VALUES (?)", [BindInt(1)]))
@@ -102,14 +101,12 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   client.close(c)
 }
 
-fn count_uniq(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM uniq", []) {
+fn count_uniq(c: Pid[SqlMsg]) : Int / Spawn = match client.query_scalar(c, "SELECT COUNT(*) FROM uniq", []) {
   Ok(n) -> n
   Err(_) -> -1
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

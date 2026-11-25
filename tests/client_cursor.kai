@@ -24,7 +24,6 @@
 # (SQLITE_LOCKED) while any statement on the connection is still
 # mid-result.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -33,7 +32,7 @@ fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ (": "
 fn show_int(label: String, n: Int) : Unit / Console = show(label, int_to_string(n))
 
 # Insert `n` numbered rows.
-fn seed(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Actor[SqlMsg] = if i > n {
+fn seed(c: Pid[SqlMsg], i: Int, n: Int) : Unit / Spawn = if i > n {
   ()
 } else {
   let _ = client.exec(c, "INSERT INTO nums (n) VALUES (?)", [BindInt(i)])
@@ -73,7 +72,7 @@ fn render_chunk_result(r: Result[Progress, SqliteError]) : String = match r {
   Err(e) -> "err code=" ++ int_to_string(e.code)
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   let _ = client.exec(c, "CREATE TABLE nums (n INTEGER PRIMARY KEY)", [])
   let _ = client.exec(c, "CREATE TABLE scratch_stop (x)", [])
   let _ = client.exec(c, "CREATE TABLE scratch_close (x)", [])
@@ -207,8 +206,6 @@ fn render_first(rows: [[String]]) : String = match rows {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

@@ -4,7 +4,7 @@
 # `with_tx(c, body)` brackets the body in BEGIN / COMMIT-or-ROLLBACK:
 # COMMIT if the body returns `Ok`, ROLLBACK if it returns `Err`. The
 # fixture proves all three routes against an in-memory DB, all in
-# `Actor[SqlMsg]` — no `Ffi`.
+# `Spawn` — no `Ffi`, no mailbox.
 #
 # Cases:
 #   1. Commit path — body returns Ok; both inserts persist.
@@ -17,11 +17,10 @@
 # After each tx we print COUNT(*) to show what actually landed.
 # Trace is deterministic: `:memory:` is fresh per run.
 
-import actor
 
 import kohau.sqlite.client
 
-fn count(c: Pid[SqlMsg]) : Int / Actor[SqlMsg] = match client.query_scalar(c, "SELECT COUNT(*) FROM t", []) {
+fn count(c: Pid[SqlMsg]) : Int / Spawn = match client.query_scalar(c, "SELECT COUNT(*) FROM t", []) {
   Ok(n) -> n
   Err(_) -> -1
 }
@@ -33,7 +32,7 @@ fn show_tx(label: String, r: Result[Int, SqliteError]) : Unit / Console = match 
 
 fn show_count(label: String, n: Int) : Unit / Console = Stdout.print(label ++ (": count=" ++ int_to_string(n)))
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   let _ = client.exec(c, "CREATE TABLE t (id TEXT PRIMARY KEY, data TEXT NOT NULL)", [])
   # ---- 1. commit path ----
   # Body returns Ok(2) — the value of the last insert's change count,
@@ -71,8 +70,6 @@ fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

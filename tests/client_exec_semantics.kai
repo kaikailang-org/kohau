@@ -2,7 +2,6 @@
 # that returns rows, and what its changes count means after statements
 # that are not INSERT / UPDATE / DELETE.
 
-import actor
 
 import kohau.sqlite.client
 
@@ -33,7 +32,7 @@ fn show_compiled(label: String, r: Result[(Int, Int), SqliteError]) : Unit / Con
   Err(e) -> Stdout.print(label ++ (": ERR " ++ client.error_to_string(e)))
 }
 
-fn rows_returned(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn rows_returned(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   show_exec("pragma busy_timeout set", client.exec(c, "PRAGMA busy_timeout = 2000", []))
   show_rows("pragma busy_timeout read", client.query_rows(c, "PRAGMA busy_timeout", []))
   show_exec("pragma user_version set", client.exec(c, "PRAGMA user_version = 7", []))
@@ -50,7 +49,7 @@ fn rows_returned(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   show_exec("error on second row", client.exec(c, "WITH c(x) AS (VALUES (1), (2)) SELECT CASE WHEN x = 2 THEN abs(-9223372036854775808) ELSE x END FROM c", []))
 }
 
-fn changes_count(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn changes_count(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   show_exec("create t", client.exec(c, "CREATE TABLE t (x INTEGER)", []))
   show_exec("insert three", client.exec(c, "INSERT INTO t VALUES (1), (2), (3)", []))
   show_exec("create table after insert", client.exec(c, "CREATE TABLE u (x INTEGER)", []))
@@ -69,15 +68,13 @@ fn changes_count(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
   show_exec("drop after delete", client.exec(c, "DROP TABLE u", []))
 }
 
-fn body(c: Pid[SqlMsg]) : Unit / Actor[SqlMsg] + Console {
+fn body(c: Pid[SqlMsg]) : Unit / Spawn + Console {
   rows_returned(c)
   changes_count(c)
   client.close(c)
 }
 
 fn main() : Int / Spawn + Ffi + Console {
-  with_mailbox(() => {
-    client.with_client(":memory:", body)
-  })
+  client.with_client(":memory:", body)
   0
 }

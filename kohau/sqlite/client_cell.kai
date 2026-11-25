@@ -208,7 +208,7 @@ fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] 
   CacheStats(reply_to) -> {
     # Answered from the cache alone: it needs no connection, so it
     # reports honestly even on a cell whose open failed.
-    Actor.send(reply_to, Reply(CacheInfo(st.cache.compiled, cache_size(st.cache.entries))))
+    Actor.send(reply_to, CacheInfo(st.cache.compiled, cache_size(st.cache.entries)))
     cell.keep(st)
   }
   CursorOpen(sql, binds, reply_to) -> cell.keep(handle_cursor_open(st, sql, binds, reply_to))
@@ -218,23 +218,19 @@ fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] 
     let _ = close_conn(st)
     cell.cell_done()
   }
-  Reply(_) ->
-  # A `Reply` never arrives at the cell's own mailbox; if one does
-  # (a misrouted message), ignore it and keep running.
-  cell.keep(st)
 }
 
 # Run one operation, send its reply, and return the state to carry
 # forward. With no connection the reply is the typed open-failure and
 # the state is untouched.
-fn dispatch(st: CellState, reply_to: Pid[SqlMsg], op: (StmtCache, Db) -> OpResult / Ffi) : CellState / Actor[SqlMsg] + Ffi = match st.db {
+fn dispatch(st: CellState, reply_to: Pid[SqlReply], op: (StmtCache, Db) -> OpResult / Ffi) : CellState / Actor[SqlMsg] + Ffi = match st.db {
   None -> {
-    Actor.send(reply_to, Reply(SqlErr(local_error("no connection: open failed"))))
+    Actor.send(reply_to, SqlErr(local_error("no connection: open failed")))
     st
   }
   Some(d) -> {
     let r = op(st.cache, d)
-    Actor.send(reply_to, Reply(r.reply))
+    Actor.send(reply_to, r.reply)
     CellState { db: st.db, cache: r.cache, cursors: st.cursors, next_id: st.next_id }
   }
 }

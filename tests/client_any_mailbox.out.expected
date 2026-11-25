@@ -1,0 +1,7 @@
+create: ok 0
+archive a: ok 1
+archive b: ok 1
+forget a: ok 1
+archive c: ok 1
+archive holds: b,c
+count from a fiber without a mailbox: ok 2
