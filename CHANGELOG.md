@@ -5,6 +5,51 @@ follows [Keep a Changelog](https://keepachangelog.com/), and the
 project adheres to [Semantic Versioning](https://semver.org/) once
 1.0.0 ships.
 
+## [0.6.0] — 2026-11-25
+
+One breaking change to the SQLite client's effect rows; see *Changed*.
+Verified on kaikai 0.200.2.
+
+### Changed
+
+- **The SQLite client no longer uses the caller's mailbox.** Its
+  helpers had the row `Actor[SqlMsg]`: the reply came back on the
+  caller's own mailbox, so an actor whose mailbox takes its own
+  message type could not use the client. Each call now takes its
+  reply on a one-shot fiber with a mailbox of its own, and the helpers'
+  row is `Spawn`. A request carries a `Pid[SqlReply]`, and `SqlMsg`
+  loses its `Reply` variant. The cost is a fiber per call, about
+  15 µs more on a trivial statement.
+
+  **Migrating:** write `Spawn` where you wrote `Actor[SqlMsg]`, in
+  `with_client` bodies, `with_tx` bodies and `fold_chunks` steps, and
+  drop the `with_mailbox` you opened only for the client. Code that
+  built `SqlMsg` requests by hand passes a `Pid[SqlReply]` and
+  receives a bare `SqlReply`.
+
+### Fixed
+
+- **`exec` runs a statement that answers with a row.** A pragma that
+  sets a value and reports it back, such as `PRAGMA busy_timeout =
+  2000`, failed with "another row available". `exec` now steps to the
+  end and discards the rows, as `sqlite3_exec` does; a failure on a
+  later row is still reported.
+- **`exec` reports `0` changes for anything but INSERT, UPDATE and
+  DELETE.** After DDL or a pragma it returned the row count of the
+  last DML statement on the connection. DML keeps its exact count,
+  trigger changes excluded.
+
+### Added
+
+- **`sqlite.interrupt(db)`** stops the statement running on a
+  connection, from another fiber while one is blocked in `step`. The
+  step returns `SQLITE_INTERRUPT` and the connection stays usable.
+- **`sqlite.set_progress_limit(db, n)`** fails any single `step`,
+  `exec` or `prepare` that runs past about `n` VM instructions; `0`
+  removes the limit. It counts per call, so a short statement reused
+  from a cache is never cut, however often it runs.
+- **`sqlite.total_changes(db)`** and the `SQLITE_INTERRUPT` constant.
+
 ## [0.5.4] — 2026-11-22
 
 No change to the public surface or to behaviour: a consumer builds
