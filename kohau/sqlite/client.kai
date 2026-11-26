@@ -123,12 +123,8 @@
 #     inside `with_tx`. Reading a table while writing to it is
 #     defined but rarely what a caller means; bracket the scan when
 #     it needs a stable view.
-#   - **No restart-on-failure.** `with_client` spawns a bare cell;
-#     if it dies, calls on its pid park forever. Re-`open` would
-#     lose the prepared statements and any open transaction, so a
-#     restart needs a story for calls in flight, not a wrapper.
-#     kohau's Postgres client reconnects a dropped connection in
-#     `with_reconnecting_client`.
+#   - **A fault in `with_client`'s cell is not recovered.** Calls on its
+#     pid park forever; use `with_supervised_client` to reopen.
 #   - **No connection pool.** One connection per cell.
 #
 # ## Stability
@@ -143,11 +139,13 @@ import actor
 
 import spawn
 
+import ahu.restart
+
 import kohau.sqlite
 
-import kohau.sqlite.client_cache
-
 import kohau.sqlite.client_cell
+
+import kohau.sqlite.client_supervised
 
 # ---- protocol ----
 
@@ -180,7 +178,9 @@ pub type Bind
 #              wording changes between releases.
 #
 # `code` is `0` for failures that never reached SQLite — a cell with
-# no connection, or a protocol violation on the mailbox.
+# no connection, or a protocol violation on the mailbox. A supervised
+# client uses the negative codes `CLIENT_RESTARTED` and
+# `CLIENT_GAVE_UP`.
 #[unstable]
 pub type SqliteError = { code: Int, extended: Int, message: String }
 
@@ -228,6 +228,7 @@ pub type SqlReply
 #   QueryRow(sql, binds, reply)    — ≤1-row statement
 #   QueryRows(sql, binds, reply)   — multi-row statement
 #   QueryScalar(sql, binds, reply) — single-Int-column statement
+#   Fault(reason, reply)           — fault while serving this request
 #   Shutdown                       — close the connection, exit
 #[unstable]
 pub type SqlMsg
@@ -239,6 +240,7 @@ pub type SqlMsg
   | CursorOpen(String, [Bind], Pid[SqlReply])
   | CursorFetch(Int, Int, Pid[SqlReply])
   | CursorClose(Int)
+  | Fault(String, Pid[SqlReply])
   | Shutdown
 
 # ---- errors ----
@@ -265,11 +267,21 @@ pub(pkg) fn local_error(message: String) : SqliteError = SqliteError { code: 0, 
 #[unstable]
 pub fn caller_error(message: String) : SqliteError = local_error(message)
 
+# The code of a call that a supervised client lost: the one in flight
+# when the cell faulted, or a statement of the transaction it took down.
+#[unstable]
+pub const CLIENT_RESTARTED : Int = -1
+
+# The code of every call once a supervised client has used up its
+# restarts.
+#[unstable]
+pub const CLIENT_GAVE_UP : Int = -2
+
 # Render an error for logs and fixtures: the message, with the codes
 # appended when SQLite supplied them. The extended code is only
 # shown when it says more than the primary one.
 #[unstable]
-pub fn error_to_string(e: SqliteError) : String = if e.code == 0 {
+pub fn error_to_string(e: SqliteError) : String = if e.code <= 0 {
   e.message
 } else if e.extended == e.code {
   e.message ++ (" [" ++ (int_to_string(e.code) ++ "]"))
@@ -321,18 +333,41 @@ pub fn error_to_string(e: SqliteError) : String = if e.code == 0 {
 # `exec` and it wins.
 #[unstable]
 pub fn with_client[r, e](path: String, body: (Pid[SqlMsg]) -> r / Spawn + e) : r / Spawn + Ffi + e {
-  let db = sqlite.open(path)
-  let _ = set_wal(db)
-  let pid = spawn_actor(() => sql_loop(CellState { db: db, cache: cache_empty(), cursors: [], next_id: 1 }))
+  let start = open_cell(path, 1)
+  let pid = spawn_actor(() => sql_loop(start))
   body(pid)
 }
 
-# Put the connection in WAL journal mode. Returns the SQLite rc, or
-# `SQLITE_OK` when there is no connection to configure. The result
-# is advisory — see `with_client` on why a refusal is not fatal.
-fn set_wal(db: Option[Db]) : Int / Ffi = match db {
-  Some(d) -> sqlite.exec(d, "PRAGMA journal_mode = WAL")
-  None -> 0
+# `with_client` whose cell survives its own faults. Each request runs
+# on a fiber of its own; when that fiber faults, the cell closes the
+# connection, opens `path` again and answers the request in flight with
+# `CLIENT_RESTARTED`. The pid stays the same.
+#
+# A restart loses what belonged to the old connection: the statement
+# cache, open cursors, which then fail as unknown, per-connection
+# settings such as `busy_timeout`, and any open transaction. After a
+# transaction is lost, every call fails with `CLIENT_RESTARTED` until
+# the `ROLLBACK` or `COMMIT` that ends it, so `with_tx` fails as a
+# whole instead of running its remaining statements on their own.
+#
+# `limit` bounds the restarts. A fault past it closes the client:
+# every later call fails with `CLIENT_GAVE_UP`. `close` still ends it.
+#
+# Each request costs two fibers more than on `with_client`.
+#[unstable]
+pub fn with_supervised_client[r, e](path: String, limit: RestartLimit, body: (Pid[SqlMsg]) -> r / Spawn + e) : r / Spawn + Ffi + Link + Cancel + e {
+  let start = supervised(path, limit, open_cell(path, 1))
+  let pid = spawn_actor(() => supervised_loop(start))
+  body(pid)
+}
+
+# Fault the cell while it serves this request, to exercise the code
+# that handles a restart. Only a supervised client faults; on any other
+# the call fails and nothing else happens.
+#[unstable]
+pub fn fault(c: Pid[SqlMsg], reason: String) : Result[Unit, SqliteError] / Spawn = match call(c, me => Fault(reason, me)) {
+  SqlErr(e) -> Err(e)
+  _ -> Err(local_error("protocol: unexpected reply to Fault"))
 }
 
 # Send the request `build` makes and wait for its reply, on a

@@ -1,0 +1,138 @@
+# tests/client_supervised.kai — a supervised client survives faults of
+# its cell: the call in flight fails, later calls reach the same file,
+# cursors and transactions of the lost connection do not come back, and
+# the restart limit closes the client. No faulted connection stays open.
+
+import time
+
+import ahu.restart
+
+import kohau.sqlite
+
+import kohau.sqlite.client
+
+fn show(label: String, s: String) : Unit / Console = Stdout.print(label ++ ": " ++ s)
+
+fn render_err(e: SqliteError) : String = int_to_string(e.code) ++ " " ++ client.error_to_string(e)
+
+fn render_unit(r: Result[Unit, SqliteError]) : String = match r {
+  Ok(_) -> "ok"
+  Err(e) -> render_err(e)
+}
+
+fn render_int(r: Result[Int, SqliteError]) : String = match r {
+  Ok(n) -> "ok " ++ int_to_string(n)
+  Err(e) -> render_err(e)
+}
+
+fn count(c: Pid[SqlMsg]) : Result[Int, SqliteError] / Spawn =
+  client.query_scalar(c, "SELECT count(*) FROM t", [])
+
+fn insert(c: Pid[SqlMsg], n: Int) : Result[Int, SqliteError] / Spawn =
+  client.exec(c, "INSERT INTO t VALUES (?)", [BindInt(n)])
+
+fn in_flight(c: Pid[SqlMsg]) : Unit / Spawn + Console {
+  let _ = client.exec(c, "DROP TABLE IF EXISTS t", [])
+  let _ = client.exec(c, "CREATE TABLE t (n INTEGER)", [])
+  show("insert", render_int(insert(c, 1)))
+  show("fault", render_unit(client.fault(c, "boom")))
+  show("same file after restart", render_int(count(c)))
+}
+
+fn cursors(c: Pid[SqlMsg]) : Unit / Spawn + Console {
+  let _ = insert(c, 2)
+  match client.open_cursor(c, "SELECT n FROM t", []) {
+    Err(e) -> show("open cursor", render_err(e))
+    Ok(old) -> {
+      let _ = client.fetch_chunk(c, old, 1)
+      let _ = client.fault(c, "with a cursor open")
+      match client.fetch_chunk(c, old, 1) {
+        Ok(_) -> show("old cursor", "still alive")
+        Err(e) -> show("old cursor", render_err(e))
+      }
+      match client.open_cursor(c, "SELECT n FROM t", []) {
+        Err(e) -> show("new cursor", render_err(e))
+        Ok(new) -> show("new cursor id differs", if new.id == old.id { "no" } else { "yes" })
+      }
+    }
+  }
+}
+
+fn broken_tx(c: Pid[SqlMsg], swallow: Bool) : Result[Int, SqliteError] / Spawn + Console =
+  client.with_tx(c, tx => {
+    let _ = insert(tx, 100)
+    let _ = client.fault(tx, "mid transaction")
+    let after = insert(tx, 101)
+    show("statement after the fault", render_int(after))
+    if swallow {
+      Ok(0)
+    } else {
+      after
+    }
+  })
+
+fn transactions(c: Pid[SqlMsg]) : Unit / Spawn + Console {
+  show("tx whose body fails", render_int(broken_tx(c, false)))
+  show("rows", render_int(count(c)))
+  show("tx whose body ignores it", render_int(broken_tx(c, true)))
+  show("rows", render_int(count(c)))
+  show("next tx", render_int(client.with_tx(c, tx => insert(tx, 3))))
+  show("rows", render_int(count(c)))
+}
+
+fn exhausted(c: Pid[SqlMsg]) : Unit / Spawn + Console {
+  show("first fault", render_unit(client.fault(c, "one")))
+  show("second fault", render_unit(client.fault(c, "two")))
+  show("after the limit", render_int(count(c)))
+  client.close(c)
+}
+
+# True when a fresh connection can take the file out of WAL, which
+# needs every other connection to it closed.
+fn released(path: String) : Bool / Ffi = match sqlite.open(path) {
+  None -> false
+  Some(db) -> {
+    let mode = match sqlite.prepare(db, "PRAGMA journal_mode = DELETE") {
+      None -> ""
+      Some(stmt) -> {
+        let m =
+          if sqlite.step(stmt) == sqlite.SQLITE_ROW { sqlite.column_text(stmt, 0) } else { "" }
+        let _ = sqlite.finalize(stmt)
+        m
+      }
+    }
+    let _ = sqlite.close(db)
+    mode == "delete"
+  }
+}
+
+fn wait_released(path: String, tries: Int) : Bool / Ffi + Clock = if released(path) {
+  true
+} else if tries <= 0 {
+  false
+} else {
+  sleep(millis(10))
+  wait_released(path, tries - 1)
+}
+
+fn released_line(path: String) : Unit / Ffi + Clock + Console =
+  show("connections closed", if wait_released(path, 300) { "yes" } else { "no" })
+
+fn main() : Int / Spawn + Ffi + Link + Cancel + Console + Clock {
+  let path = "build/client_supervised.db"
+  client.with_supervised_client(path, Limit(10), c => {
+    in_flight(c)
+    cursors(c)
+    transactions(c)
+    client.close(c)
+  })
+  released_line(path)
+  client.with_supervised_client(path, Limit(1), exhausted)
+  released_line(path)
+  client.with_client(":memory:", c => {
+    show("unsupervised fault", render_unit(client.fault(c, "ignored")))
+    show("unsupervised still serves", render_int(client.query_scalar(c, "SELECT 7", [])))
+    client.close(c)
+  })
+  0
+}

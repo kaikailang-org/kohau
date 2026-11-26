@@ -346,6 +346,22 @@ int kai_sqlite_extended_errcode(int64_t handle) {
     return sqlite3_extended_errcode((sqlite3 *)(intptr_t)handle);
 }
 
+// Finalize every statement still live on the connection, then close
+// it. Works without knowing which statements the caller holds.
+int kai_sqlite_close_all(int64_t handle) {
+    if (handle == 0) return SQLITE_OK;
+    sqlite3 *db = (sqlite3 *)(intptr_t)handle;
+    sqlite3_stmt *stmt;
+    while ((stmt = sqlite3_next_stmt(db, NULL)) != NULL) sqlite3_finalize(stmt);
+    return sqlite3_close(db);
+}
+
+// Non-zero when no transaction is open.
+int kai_sqlite_autocommit(int64_t handle) {
+    if (handle == 0) return 1;
+    return sqlite3_get_autocommit((sqlite3 *)(intptr_t)handle);
+}
+
 // ---- interruption ----
 
 // Make the statement running on this connection return

@@ -20,6 +20,8 @@
 
 int64_t     kai_sqlite_open(const char *path);
 int         kai_sqlite_close(int64_t handle);
+int         kai_sqlite_close_all(int64_t handle);
+int         kai_sqlite_autocommit(int64_t handle);
 int         kai_sqlite_exec(int64_t handle, const char *sql);
 int64_t     kai_sqlite_prepare(int64_t handle, const char *sql);
 int         kai_sqlite_bind_text(int64_t stmt_handle, int idx, const char *value);
