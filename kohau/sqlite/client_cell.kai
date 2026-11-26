@@ -200,7 +200,7 @@ fn close_conn(st: CellState) : Int / Ffi = match st.db {
 # Both query forms discover their column count from the prepared
 # statement, so they handle arbitrary SELECTs — including `SELECT *`
 # — without the caller declaring a width.
-fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] + Ffi = match msg {
+pub(pkg) fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] + Ffi = match msg {
   Exec(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_exec(c, d, sql, binds)))
   QueryRow(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_row(c, d, sql, binds)))
   QueryRows(sql, binds, reply_to) -> cell.keep(dispatch(st, reply_to, (c, d) => run_query_rows(c, d, sql, binds)))
@@ -214,6 +214,10 @@ fn sql_step(st: CellState, msg: SqlMsg) : StepResult[CellState] / Actor[SqlMsg] 
   CursorOpen(sql, binds, reply_to) -> cell.keep(handle_cursor_open(st, sql, binds, reply_to))
   CursorFetch(id, budget, reply_to) -> cell.keep(handle_cursor_fetch(st, id, budget, reply_to))
   CursorClose(id) -> cell.keep(handle_cursor_close(st, id))
+  Fault(_, reply_to) -> {
+    Actor.send(reply_to, SqlErr(local_error("fault: this client is not supervised")))
+    cell.keep(st)
+  }
   Shutdown -> {
     let _ = close_conn(st)
     cell.cell_done()
@@ -233,6 +237,22 @@ fn dispatch(st: CellState, reply_to: Pid[SqlReply], op: (StmtCache, Db) -> OpRes
     Actor.send(reply_to, r.reply)
     CellState { db: st.db, cache: r.cache, cursors: st.cursors, next_id: st.next_id }
   }
+}
+
+# A cell state over a fresh connection to `path`. Cursor ids start at
+# `next_id`, so a reopened cell never reissues one.
+pub(pkg) fn open_cell(path: String, next_id: Int) : CellState / Ffi {
+  let db = sqlite.open(path)
+  let _ = set_wal(db)
+  CellState { db: db, cache: cache_empty(), cursors: [], next_id: next_id }
+}
+
+# Put the connection in WAL journal mode. Returns the SQLite rc, or
+# `SQLITE_OK` when there is no connection to configure. The result is
+# advisory — see `with_client` on why a refusal is not fatal.
+fn set_wal(db: Option[Db]) : Int / Ffi = match db {
+  Some(d) -> sqlite.exec(d, "PRAGMA journal_mode = WAL")
+  None -> 0
 }
 
 # The cell dispatch loop, spawned as its own fiber by `with_client`.

@@ -138,6 +138,20 @@ pub fn open(path: String) : Option[Db] / Ffi {
 #[unstable]
 pub fn close(h: Db) : Int / Ffi = kai_sqlite_close(h.raw)
 
+extern "C" fn kai_sqlite_close_all(h: Int) : I32 / Ffi
+
+extern "C" fn kai_sqlite_autocommit(h: Int) : I32 / Ffi
+
+# Finalize every statement still live on the connection, then close it,
+# rolling back any open transaction. The connection's `Stmt` handles
+# must not be used after.
+#[unstable]
+pub fn close_all(h: Db) : Int / Ffi = kai_sqlite_close_all(h.raw)
+
+# Whether the connection is outside a transaction.
+#[unstable]
+pub fn autocommit(h: Db) : Bool / Ffi = kai_sqlite_autocommit(h.raw) != 0
+
 # ---- single-shot execution ----
 
 extern "C" fn kai_sqlite_exec(h: Int, sql: String) : I32 / Ffi

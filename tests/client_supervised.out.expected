@@ -1,0 +1,20 @@
+insert: ok 1
+fault: -1 restarted: the connection was reopened after a fault: Trapped: boom
+same file after restart: ok 1
+old cursor: 0 unknown cursor: 1
+new cursor id differs: yes
+statement after the fault: -1 transaction lost to a restart
+tx whose body fails: -1 transaction lost to a restart
+rows: ok 2
+statement after the fault: -1 transaction lost to a restart
+tx whose body ignores it: -1 COMMIT failed: transaction lost to a restart
+rows: ok 2
+next tx: ok 1
+rows: ok 3
+connections closed: yes
+first fault: -1 restarted: the connection was reopened after a fault: Trapped: one
+second fault: -2 no connection: restart limit reached
+after the limit: -2 no connection: restart limit reached
+connections closed: yes
+unsupervised fault: 0 fault: this client is not supervised
+unsupervised still serves: ok 7

@@ -1,0 +1,202 @@
+# kohau/sqlite/client_supervised.kai — the supervised client's cell.
+# Internal to the package: `kohau.sqlite.client` is the surface.
+#
+# The cell cannot learn of its own death through its mailbox, so it
+# does not die: each request runs on a linked fiber under an overseer
+# that traps exits, and a fault costs the connection, not the cell.
+
+import actor
+import spawn
+import ahu.cell
+import ahu.restart
+import kohau.sqlite
+import kohau.sqlite.client
+import kohau.sqlite.client_cache
+import kohau.sqlite.client_cell
+
+# `dead` holds once the restarts are spent; `lost_tx` while a
+# transaction lost to a restart has not been ended by its caller.
+pub(pkg) type Supervised = {
+  path: String,
+  limit: Int,
+  restarts: Int,
+  state: CellState,
+  lost_tx: Bool,
+  dead: Bool
+}
+
+pub(pkg) fn supervised(path: String, limit: RestartLimit, state: CellState) : Supervised {
+  let most = match limit {
+    Limit(n) -> n
+  }
+  Supervised { path: path, limit: most, restarts: 0, state: state, lost_tx: false, dead: false }
+}
+
+pub(pkg) fn supervised_loop(s: Supervised) : Unit / Actor[SqlMsg] + Spawn + Link + Cancel + Ffi {
+  let msg = Actor.receive()
+  match msg {
+    Shutdown -> {
+      let _ = sql_step(s.state, msg)
+      ()
+    }
+    _ -> supervised_loop(handle_request(s, msg))
+  }
+}
+
+fn handle_request(
+  s: Supervised,
+  msg: SqlMsg
+) : Supervised / Actor[SqlMsg] + Spawn + Link + Cancel + Ffi =
+  if s.dead {
+    answer(msg, gave_up())
+    s
+  } else if s.lost_tx {
+    in_lost_tx(s, msg)
+  } else {
+    guarded(s, msg)
+  }
+
+type Outcome
+  = Served(CellState)
+  | Faulted(String)
+
+fn guarded(s: Supervised, msg: SqlMsg) : Supervised / Actor[SqlMsg] + Spawn + Link + Cancel + Ffi {
+  let outcome = nursery { n ->
+    let f = n.spawn(() => with_mailbox(() => oversee(s.state, msg)))
+    n.await(f)
+  }
+  match outcome {
+    Served(state) -> Supervised { ...s, state: state }
+    Faulted(reason) -> recover(s, msg, reason)
+  }
+}
+
+fn oversee(st: CellState, msg: SqlMsg) : Outcome / Actor[String] + Spawn + Link + Cancel + Ffi {
+  let _ = set_trap_exit(true)
+  let me = Actor.self()
+  let worker = spawn(() => with_mailbox(() => serve(me, st, msg)))
+  let reason = Actor.receive()
+  if reason == "Normal" {
+    Served(await(worker))
+  } else {
+    Faulted(reason)
+  }
+}
+
+fn serve(
+  overseer: Pid[String],
+  st: CellState,
+  msg: SqlMsg
+) : CellState / Actor[SqlMsg] + Link + Cancel + Ffi {
+  Link.link(overseer)
+  match msg {
+    Fault(reason, _) -> panic(reason)
+    _ -> match sql_step(st, msg) {
+      Continue(next) -> next
+      Done -> st
+    }
+  }
+}
+
+# Replace the connection, then answer the request that was lost.
+fn recover(s: Supervised, msg: SqlMsg, reason: String) : Supervised / Actor[SqlMsg] + Ffi {
+  let open_tx = discard(s.state.db)
+  let spent = s.restarts >= s.limit
+  let state = if spent {
+    CellState { db: None, cache: cache_empty(), cursors: [], next_id: s.state.next_id }
+  } else {
+    open_cell(s.path, s.state.next_id)
+  }
+  answer(
+    msg,
+    if spent {
+      gave_up()
+    } else {
+      lost("restarted: the connection was reopened after a fault: " ++ reason)
+    }
+  )
+  Supervised {
+    ...s,
+    restarts: s.restarts + 1,
+    state: state,
+    lost_tx: open_tx and (not controls_tx(msg)),
+    dead: spent
+  }
+}
+
+# Close the faulted connection; whether it had a transaction open. The
+# statements are finalized through SQLite, since the fault may have left
+# the cell's own record of them behind.
+fn discard(db: Option[Db]) : Bool / Ffi = match db {
+  Some(d) -> {
+    let open_tx = not sqlite.autocommit(d)
+    let _ = sqlite.close_all(d)
+    open_tx
+  }
+  None -> false
+}
+
+fn in_lost_tx(
+  s: Supervised,
+  msg: SqlMsg
+) : Supervised / Actor[SqlMsg] + Spawn + Link + Cancel + Ffi =
+  match msg {
+    CacheStats(_) -> guarded(s, msg)
+    Exec(sql, _, reply_to) if rolls_back(sql) -> {
+      Actor.send(reply_to, ExecOk(0))
+      Supervised { ...s, lost_tx: false }
+    }
+    Exec(sql, _, _) if commits(sql) -> {
+      answer(msg, lost("transaction lost to a restart"))
+      Supervised { ...s, lost_tx: false }
+    }
+    _ -> {
+      answer(msg, lost("transaction lost to a restart"))
+      s
+    }
+  }
+
+fn verb(sql: String) : String {
+  let text = string.to_upper(string.trim(sql))
+  string.trim(string.drop_suffix(text, ";") ?? text)
+}
+
+fn rolls_back(sql: String) : Bool {
+  let v = verb(sql)
+  v == "ROLLBACK" or v == "ROLLBACK TRANSACTION"
+}
+
+fn commits(sql: String) : Bool {
+  let v = verb(sql)
+  v == "COMMIT" or v == "COMMIT TRANSACTION" or v == "END" or v == "END TRANSACTION"
+}
+
+# Whether the request itself opens or ends a transaction, so no caller
+# is left inside one when it is lost.
+fn controls_tx(msg: SqlMsg) : Bool = match msg {
+  Exec(sql, _, _) -> string.starts_with(verb(sql), "BEGIN") or commits(sql) or rolls_back(sql)
+  _ -> false
+}
+
+fn lost(message: String) : SqlReply =
+  SqlErr(SqliteError { code: client.CLIENT_RESTARTED, extended: 0, message: message })
+
+fn gave_up() : SqlReply =
+  SqlErr(SqliteError {
+    code: client.CLIENT_GAVE_UP,
+    extended: 0,
+    message: "no connection: restart limit reached"
+  })
+
+fn answer(msg: SqlMsg, reply: SqlReply) : Unit / Actor[SqlMsg] = match msg {
+  Exec(_, _, to) -> Actor.send(to, reply)
+  QueryRow(_, _, to) -> Actor.send(to, reply)
+  QueryRows(_, _, to) -> Actor.send(to, reply)
+  QueryScalar(_, _, to) -> Actor.send(to, reply)
+  CacheStats(to) -> Actor.send(to, reply)
+  CursorOpen(_, _, to) -> Actor.send(to, reply)
+  CursorFetch(_, _, to) -> Actor.send(to, reply)
+  Fault(_, to) -> Actor.send(to, reply)
+  CursorClose(_) -> ()
+  Shutdown -> ()
+}
